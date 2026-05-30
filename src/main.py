@@ -607,6 +607,38 @@ def main():
                     except Exception as _adopt_err:
                         add_event(f"ADOPT ERROR for {_pos.get('coin')}: {_adopt_err}")
 
+            # Re-arm mandatory SL on adopted positions that lack one
+            if cycle_state_healthy:
+                for tr in active_trades:
+                    if not tr.get('_adopted') or tr.get('sl_oid') or tr.get('_sl_rearm_attempted'):
+                        continue
+                    _ra_asset = tr.get('asset')
+                    _ra_long = tr.get('is_long')
+                    _ra_size = abs(float(tr.get('amount') or tr.get('original_size') or 0))
+                    _ra_entry = float(tr.get('entry_price') or 0)
+                    if not _ra_asset or _ra_size <= 0 or _ra_entry <= 0:
+                        tr['_sl_rearm_attempted'] = True
+                        continue
+                    try:
+                        _ra_sl_pct = float(CONFIG.get("mandatory_sl_pct") or 5) / 100.0
+                        if _ra_long:
+                            _ra_sl_price = _ra_entry * (1.0 - _ra_sl_pct)
+                        else:
+                            _ra_sl_price = _ra_entry * (1.0 + _ra_sl_pct)
+                        _ra_res = await hyperliquid.place_stop_loss(_ra_asset, _ra_long, _ra_size, _ra_sl_price)
+                        _ra_oids = hyperliquid.extract_oids(_ra_res)
+                        if _ra_oids:
+                            tr['sl_oid'] = _ra_oids[0]
+                            tr['current_sl_price'] = _ra_sl_price
+                            save_active_trades()
+                            add_event(f"ADOPT SL-REARM: {_ra_asset} sl={_ra_sl_price:.4f} oid={_ra_oids[0]}")
+                        else:
+                            add_event(f"ADOPT SL-REARM WARN: {_ra_asset} — no oid returned")
+                    except Exception as _ra_err:
+                        add_event(f"ADOPT SL-REARM FAIL: {_ra_asset}: {_ra_err}")
+                    tr['_sl_rearm_attempted'] = True
+                    save_active_trades()
+
             recent_fills_struct = []
             try:
                 fills = await hyperliquid.get_recent_fills(limit=50)
