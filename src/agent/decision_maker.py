@@ -213,7 +213,7 @@ class TradingAgent:
             kwargs = {
                 "model": self.model,
                 "max_tokens": self.max_tokens,
-                "system": system_prompt,
+                "system": [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
                 "messages": msgs,
             }
             if use_tools and enable_tools:

@@ -78,18 +78,18 @@ CONFIG = {
 
     # LLM — Anthropic Claude API (primary)
     "anthropic_api_key": _get_env("ANTHROPIC_API_KEY", required=True),
-    "llm_model": _get_env("LLM_MODEL", "claude-sonnet-4-20250514"),
+    "llm_model": _get_env("LLM_MODEL", "claude-opus-4-8"),
     "sanitize_model": _get_env("SANITIZE_MODEL", "claude-haiku-4-5-20251001"),
-    "max_tokens": _get_int("MAX_TOKENS", 4096),
+    "max_tokens": _get_int("MAX_TOKENS", 8192),
     "enable_tool_calling": _get_bool("ENABLE_TOOL_CALLING", False),
 
     # Extended thinking (Claude)
-    "thinking_enabled": _get_bool("THINKING_ENABLED", False),
-    "thinking_budget_tokens": _get_int("THINKING_BUDGET_TOKENS", 10000),
+    "thinking_enabled": _get_bool("THINKING_ENABLED", True),
+    "thinking_budget_tokens": _get_int("THINKING_BUDGET_TOKENS", 6000),
 
     # Runtime controls
-    "assets": _get_env("ASSETS"),  # e.g., "BTC ETH SOL OIL GOLD SPX"
-    "interval": _get_env("INTERVAL"),  # e.g., "5m", "1h"
+    "assets": _get_env("ASSETS", "BTC ETH"),
+    "interval": _get_env("INTERVAL", "15m"),
 
     # Risk management
     "max_position_pct": _get_env("MAX_POSITION_PCT", "20"),
@@ -130,7 +130,7 @@ CONFIG = {
     "min_rr": _get_env("MIN_RR", "1.5"),
 
     # P2.7 — low-conviction volume gate
-    "min_vol_spike_ratio": _get_env("MIN_VOL_SPIKE_RATIO", "0.5"),
+    "min_vol_spike_ratio": _get_env("MIN_VOL_SPIKE_RATIO", "0.3"),
 
     # P2.5.4 — concise mode: shorter LLM output on hold-all cycles
     "concise_mode": _get_bool("CONCISE_MODE", True),
@@ -158,7 +158,11 @@ CONFIG = {
     "regime_refresh_minutes": _get_env("REGIME_REFRESH_MINUTES", "60"),
 
     # P4.2 — regime-conditional gate: hard-reject new entries in volatile regime
-    "regime_gate_volatile": _get_bool("REGIME_GATE_VOLATILE", True),
+    "regime_gate_volatile": _get_bool("REGIME_GATE_VOLATILE", False),
+
+    # P4.2 soft-gate multipliers
+    "volatile_size_mult": _get_env("VOLATILE_SIZE_MULT", "0.5"),
+    "vol_gate_hard": _get_bool("VOL_GATE_HARD", False),
 
     # Legacy / optional
     "taapi_api_key": _get_env("TAAPI_API_KEY"),
