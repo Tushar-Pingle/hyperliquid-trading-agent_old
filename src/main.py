@@ -304,13 +304,23 @@ def main():
                     add_event(f"P4.1 regime refresh failed (non-fatal): {_re}")
                     last_regime_refresh_ts = time.time()  # don't retry every cycle on failure
 
-            # Global account state
-            state = await hyperliquid.get_user_state()
-            total_value = state.get('total_value') or state['balance'] + sum(p.get('pnl', 0) for p in state['positions'])
+            # Global account state — treat failed/zeroed reads as stale
+            _state_fetch_ok = False
+            try:
+                state = await hyperliquid.get_user_state()
+                total_value = state.get('total_value') or state['balance'] + sum(p.get('pnl', 0) for p in state['positions'])
+                if total_value > 1.0:
+                    _state_fetch_ok = True
+            except Exception as _se:
+                add_event(f"WARN: get_user_state failed: {_se}")
+                state = {"balance": 0.0, "total_value": 0.0, "positions": [], "effective_collateral": 0.0, "perp_notional": 0.0}
+                total_value = 0.0
+            # Preliminary guard — will be updated to False if open_orders fetch fails
+            cycle_state_healthy = _state_fetch_ok
             sharpe = calculate_sharpe(trade_log)
 
             account_value = total_value
-            if initial_account_value is None:
+            if initial_account_value is None and total_value > 1.0:
                 initial_account_value = account_value
             total_return_pct = ((account_value - initial_account_value) / initial_account_value * 100.0) if initial_account_value else 0.0
 
@@ -329,62 +339,63 @@ def main():
                     "leverage": pos.get('leverage')
                 })
 
-            # --- RISK: Force-close positions that exceed max loss ---
-            try:
-                positions_to_close = risk_mgr.check_losing_positions(state['positions'])
-                for ptc in positions_to_close:
-                    coin = ptc["coin"]
-                    size = ptc["size"]
-                    is_long = ptc["is_long"]
-                    add_event(
-                        f"RISK FORCE-CLOSE: {coin} margin-loss {ptc['loss_pct']}% "
-                        f"(pnl=${ptc['pnl']}, margin=${ptc.get('margin', 0)}, "
-                        f"lev={ptc.get('leverage', '?')}x"
-                        f"{' [fallback]' if ptc.get('leverage_fallback') else ''})"
-                    )
-                    try:
-                        if is_long:
-                            await hyperliquid.place_sell_order(coin, size)
-                        else:
-                            await hyperliquid.place_buy_order(coin, size)
-                        await hyperliquid.cancel_all_orders(coin)
-                        risk_mgr.record_cooldown(coin, "force_close")  # P1.2
-                        # Remove from active trades + record to trade log (P2.5)
-                        matched_tr = None
-                        for tr in active_trades[:]:
-                            if tr.get('asset') == coin:
-                                matched_tr = tr
-                                active_trades.remove(tr)
-                        save_active_trades()  # H5
-                        exit_px = await hyperliquid.get_current_price(coin)
-                        _try_record_close(
-                            coin, matched_tr, exit_px, ptc["pnl"],
-                            "force_close",
-                            margin=ptc.get("margin"),
-                            leverage=ptc.get("leverage"),
-                            leverage_fallback=ptc.get("leverage_fallback", False),
+            if cycle_state_healthy:
+                # --- RISK: Force-close positions that exceed max loss ---
+                try:
+                    positions_to_close = risk_mgr.check_losing_positions(state['positions'])
+                    for ptc in positions_to_close:
+                        coin = ptc["coin"]
+                        size = ptc["size"]
+                        is_long = ptc["is_long"]
+                        add_event(
+                            f"RISK FORCE-CLOSE: {coin} margin-loss {ptc['loss_pct']}% "
+                            f"(pnl=${ptc['pnl']}, margin=${ptc.get('margin', 0)}, "
+                            f"lev={ptc.get('leverage', '?')}x"
+                            f"{' [fallback]' if ptc.get('leverage_fallback') else ''})"
                         )
-                        with open(diary_path, "a") as f:
-                            f.write(json.dumps({
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "asset": coin,
-                                "action": "risk_force_close",
-                                "loss_pct": ptc["loss_pct"],
-                                "pnl": ptc["pnl"],
-                                "margin": ptc.get("margin"),
-                                "leverage": ptc.get("leverage"),
-                                "leverage_fallback": ptc.get("leverage_fallback", False),
-                            }) + "\n")
-                    except Exception as fc_err:
-                        add_event(f"Force-close error for {coin}: {fc_err}")
-            except Exception as risk_err:
-                add_event(f"Risk check error: {risk_err}")
+                        try:
+                            if is_long:
+                                await hyperliquid.place_sell_order(coin, size)
+                            else:
+                                await hyperliquid.place_buy_order(coin, size)
+                            await hyperliquid.cancel_all_orders(coin)
+                            risk_mgr.record_cooldown(coin, "force_close")  # P1.2
+                            # Remove from active trades + record to trade log (P2.5)
+                            matched_tr = None
+                            for tr in active_trades[:]:
+                                if tr.get('asset') == coin:
+                                    matched_tr = tr
+                                    active_trades.remove(tr)
+                            save_active_trades()  # H5
+                            exit_px = await hyperliquid.get_current_price(coin)
+                            _try_record_close(
+                                coin, matched_tr, exit_px, ptc["pnl"],
+                                "force_close",
+                                margin=ptc.get("margin"),
+                                leverage=ptc.get("leverage"),
+                                leverage_fallback=ptc.get("leverage_fallback", False),
+                            )
+                            with open(diary_path, "a") as f:
+                                f.write(json.dumps({
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "asset": coin,
+                                    "action": "risk_force_close",
+                                    "loss_pct": ptc["loss_pct"],
+                                    "pnl": ptc["pnl"],
+                                    "margin": ptc.get("margin"),
+                                    "leverage": ptc.get("leverage"),
+                                    "leverage_fallback": ptc.get("leverage_fallback", False),
+                                }) + "\n")
+                        except Exception as fc_err:
+                            add_event(f"Force-close error for {coin}: {fc_err}")
+                except Exception as risk_err:
+                    add_event(f"Risk check error: {risk_err}")
 
             # --- S2: HIP-3 weekend auto-close ---
             # When the HIP-3 oracle freeze window is active (Fri 16:50 → Sun
             # 22:00 UTC), close any open HIP-3 positions immediately. New
             # entries are blocked separately in the trade-execution path.
-            if is_hip3_frozen():
+            if cycle_state_healthy and is_hip3_frozen():
                 for pos in state['positions']:
                     coin = pos.get('coin') or ''
                     if ':' not in coin:
@@ -449,100 +460,108 @@ def main():
                         "order_type": o.get('orderType')
                     })
             except Exception:
-                open_orders = []
+                open_orders = None
+
+            cycle_state_healthy = _state_fetch_ok and open_orders is not None
+            if not cycle_state_healthy:
+                add_event(
+                    f"SKIP cycle mutations: stale fetch "
+                    f"(total_value={total_value:.2f}, orders={'ok' if open_orders is not None else 'FAILED'})"
+                )
 
             # Reconcile active trades — C3: require 2 consecutive cycles of
             # "no position AND no orders" before purging, to avoid false
             # closures caused by cancel-fetch race conditions.
-            try:
-                # Positions: only count those with notional > $0.01 (filters dust).
-                assets_with_positions = set()
-                for pos in state['positions']:
-                    try:
-                        szi = abs(float(pos.get('szi') or 0))
-                        entry = float(pos.get('entryPx') or 0)
-                        if szi > 0 and szi * entry > 0.01:
-                            assets_with_positions.add(pos.get('coin'))
-                    except Exception:
-                        continue
-                assets_with_orders = {o.get('coin') for o in (open_orders or []) if o.get('coin')}
-                ORPHAN_CYCLES_REQUIRED = 2
-                for tr in active_trades[:]:
-                    asset = tr.get('asset')
-                    if asset not in assets_with_positions and asset not in assets_with_orders:
-                        tr['_orphan_cycles'] = tr.get('_orphan_cycles', 0) + 1
-                        if tr['_orphan_cycles'] >= ORPHAN_CYCLES_REQUIRED:
-                            add_event(f"Reconciling stale active trade for {asset} (orphan for {tr['_orphan_cycles']} cycles)")
-                            # P2.5.1: recover exit price/pnl from exchange fills so
-                            # trade_log records have real numbers instead of null.
-                            rec_exit_price = None
-                            rec_pnl = None
-                            rec_exit_unavailable = False
-                            try:
-                                rec_fills = await hyperliquid.get_recent_fills(limit=100)
-                                opened_ts_ms = 0
-                                if tr.get('opened_at'):
-                                    try:
-                                        opened_ts_ms = int(datetime.fromisoformat(
-                                            str(tr['opened_at']).replace('Z', '+00:00')
-                                        ).timestamp() * 1000)
-                                    except Exception:
-                                        pass
-                                is_long = tr.get('is_long')
-                                close_fills = []
-                                for _f in rec_fills:
-                                    f_coin = _f.get('coin') or _f.get('asset') or ''
-                                    # Match asset name; strip HIP-3 prefix (xyz:CL → CL)
-                                    if f_coin != asset:
-                                        if not (':' in asset and asset.split(':', 1)[1] == f_coin):
+            if cycle_state_healthy:
+                try:
+                    # Positions: only count those with notional > $0.01 (filters dust).
+                    assets_with_positions = set()
+                    for pos in state['positions']:
+                        try:
+                            szi = abs(float(pos.get('szi') or 0))
+                            entry = float(pos.get('entryPx') or 0)
+                            if szi > 0 and szi * entry > 0.01:
+                                assets_with_positions.add(pos.get('coin'))
+                        except Exception:
+                            continue
+                    assets_with_orders = {o.get('coin') for o in (open_orders or []) if o.get('coin')}
+                    ORPHAN_CYCLES_REQUIRED = 2
+                    for tr in active_trades[:]:
+                        asset = tr.get('asset')
+                        if asset not in assets_with_positions and asset not in assets_with_orders:
+                            tr['_orphan_cycles'] = tr.get('_orphan_cycles', 0) + 1
+                            if tr['_orphan_cycles'] >= ORPHAN_CYCLES_REQUIRED:
+                                add_event(f"Reconciling stale active trade for {asset} (orphan for {tr['_orphan_cycles']} cycles)")
+                                # P2.5.1: recover exit price/pnl from exchange fills so
+                                # trade_log records have real numbers instead of null.
+                                rec_exit_price = None
+                                rec_pnl = None
+                                rec_exit_unavailable = False
+                                try:
+                                    rec_fills = await hyperliquid.get_recent_fills(limit=100)
+                                    opened_ts_ms = 0
+                                    if tr.get('opened_at'):
+                                        try:
+                                            opened_ts_ms = int(datetime.fromisoformat(
+                                                str(tr['opened_at']).replace('Z', '+00:00')
+                                            ).timestamp() * 1000)
+                                        except Exception:
+                                            pass
+                                    is_long = tr.get('is_long')
+                                    close_fills = []
+                                    for _f in rec_fills:
+                                        f_coin = _f.get('coin') or _f.get('asset') or ''
+                                        # Match asset name; strip HIP-3 prefix (xyz:CL → CL)
+                                        if f_coin != asset:
+                                            if not (':' in asset and asset.split(':', 1)[1] == f_coin):
+                                                continue
+                                        f_time = int(_f.get('time') or _f.get('timestamp') or 0)
+                                        if f_time < opened_ts_ms:
                                             continue
-                                    f_time = int(_f.get('time') or _f.get('timestamp') or 0)
-                                    if f_time < opened_ts_ms:
-                                        continue
-                                    f_is_buy = _f.get('isBuy')
-                                    # Close of a long = sell fill; close of a short = buy fill
-                                    if is_long is True and f_is_buy is True:
-                                        continue
-                                    if is_long is False and f_is_buy is False:
-                                        continue
-                                    close_fills.append(_f)
-                                if close_fills:
-                                    close_fills.sort(key=lambda _f: int(_f.get('time') or 0))
-                                    rec_exit_price = float(close_fills[-1].get('px') or 0) or None
-                                    pnl_parts = [float(_f['closedPnl']) for _f in close_fills
-                                                 if _f.get('closedPnl') is not None]
-                                    rec_pnl = sum(pnl_parts) if pnl_parts else None
-                                else:
+                                        f_is_buy = _f.get('isBuy')
+                                        # Close of a long = sell fill; close of a short = buy fill
+                                        if is_long is True and f_is_buy is True:
+                                            continue
+                                        if is_long is False and f_is_buy is False:
+                                            continue
+                                        close_fills.append(_f)
+                                    if close_fills:
+                                        close_fills.sort(key=lambda _f: int(_f.get('time') or 0))
+                                        rec_exit_price = float(close_fills[-1].get('px') or 0) or None
+                                        pnl_parts = [float(_f['closedPnl']) for _f in close_fills
+                                                     if _f.get('closedPnl') is not None]
+                                        rec_pnl = sum(pnl_parts) if pnl_parts else None
+                                    else:
+                                        rec_exit_unavailable = True
+                                        add_event(f"No matching close fills found for {asset} reconcile; pnl stays null")
+                                except Exception as _e:
                                     rec_exit_unavailable = True
-                                    add_event(f"No matching close fills found for {asset} reconcile; pnl stays null")
-                            except Exception as _e:
-                                rec_exit_unavailable = True
-                                logging.warning("P2.5.1: fill lookup failed for %s reconcile: %s", asset, _e)
-                            _try_record_close(asset, tr, rec_exit_price, rec_pnl, "reconcile_close")
-                            active_trades.remove(tr)
-                            save_active_trades()  # H5
-                            _diary_rec = {
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "asset": asset,
-                                "action": "reconcile_close",
-                                "reason": "no_position_no_orders",
-                                "orphan_cycles": tr['_orphan_cycles'],
-                                "opened_at": tr.get('opened_at'),
-                                "exit_price": rec_exit_price,
-                                "pnl": rec_pnl,
-                            }
-                            if rec_exit_unavailable:
-                                _diary_rec["exit_data_unavailable"] = True
-                            with open(diary_path, "a") as f:
-                                f.write(json.dumps(_diary_rec) + "\n")
+                                    logging.warning("P2.5.1: fill lookup failed for %s reconcile: %s", asset, _e)
+                                _try_record_close(asset, tr, rec_exit_price, rec_pnl, "reconcile_close")
+                                active_trades.remove(tr)
+                                save_active_trades()  # H5
+                                _diary_rec = {
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "asset": asset,
+                                    "action": "reconcile_close",
+                                    "reason": "no_position_no_orders",
+                                    "orphan_cycles": tr['_orphan_cycles'],
+                                    "opened_at": tr.get('opened_at'),
+                                    "exit_price": rec_exit_price,
+                                    "pnl": rec_pnl,
+                                }
+                                if rec_exit_unavailable:
+                                    _diary_rec["exit_data_unavailable"] = True
+                                with open(diary_path, "a") as f:
+                                    f.write(json.dumps(_diary_rec) + "\n")
+                            else:
+                                add_event(f"Tentative orphan for {asset} (cycle {tr['_orphan_cycles']}/{ORPHAN_CYCLES_REQUIRED}) — deferring reconcile")
                         else:
-                            add_event(f"Tentative orphan for {asset} (cycle {tr['_orphan_cycles']}/{ORPHAN_CYCLES_REQUIRED}) — deferring reconcile")
-                    else:
-                        # Reset counter if the asset reappears on exchange
-                        if tr.get('_orphan_cycles', 0) > 0:
-                            tr['_orphan_cycles'] = 0
-            except Exception:
-                pass
+                            # Reset counter if the asset reappears on exchange
+                            if tr.get('_orphan_cycles', 0) > 0:
+                                tr['_orphan_cycles'] = 0
+                except Exception:
+                    pass
 
             recent_fills_struct = []
             try:
@@ -705,7 +724,7 @@ def main():
             # Size check kept as belt-and-suspenders only — oid match is the authoritative signal.
             # When TP1 fires: cancel old full-size SL, place breakeven SL at entry price.
             # P3.1 trailing logic then takes over for the remainder when peak advances.
-            if CONFIG.get("partial_tp_enabled", True) and CONFIG.get("move_sl_to_breakeven_at_tp1", True):
+            if cycle_state_healthy and CONFIG.get("partial_tp_enabled", True) and CONFIG.get("move_sl_to_breakeven_at_tp1", True):
                 _p32_pos_by_coin = {}
                 for _p in state.get('positions', []):
                     _pc = _p.get('coin') or ''
@@ -794,7 +813,7 @@ def main():
             # --- P3.1: Trailing stop management ---
             # Runs every cycle after market data is fresh.
             # Never loosens a stop — only moves it tighter when peak advances.
-            if CONFIG.get("trailing_stop_enabled", True):
+            if cycle_state_healthy and CONFIG.get("trailing_stop_enabled", True):
                 _trail_activate_r = float(CONFIG.get("trail_activate_r") or 1.0)
                 _trail_distance_atr = float(CONFIG.get("trail_distance_atr") or 1.0)
                 for tr in active_trades:
@@ -891,52 +910,53 @@ def main():
                     except Exception:
                         continue
 
-            for tr in active_trades[:]:
-                try:
-                    rules = tr.get("exit_rules") or []
-                    asset = tr.get("asset")
-                    if not asset or not rules:
-                        continue
-                    msec = market_by_asset.get(asset)
-                    if not msec:
-                        continue  # no market data this cycle — cannot evaluate
-                    snap = build_snapshot(msec, current_price=msec.get("current_price"))
-                    should_exit, reason = evaluate_exit_rules(rules, snap)
-                    if not should_exit:
-                        continue
-                    add_event(f"P2.2 EXIT {asset}: {reason} — closing")
+            if cycle_state_healthy:
+                for tr in active_trades[:]:
                     try:
-                        amt = abs(float(tr.get("amount") or 0))
-                        if amt > 0:
-                            if tr.get("is_long"):
-                                await hyperliquid.place_sell_order(asset, amt)
-                            else:
-                                await hyperliquid.place_buy_order(asset, amt)
-                        await hyperliquid.cancel_all_orders(asset)
-                        risk_mgr.record_cooldown(asset, "exit_rule_triggered")
-                        # P2.5: record close before removing
-                        exit_px = msec.get("current_price")
-                        # find live pnl from state if available this cycle
-                        _pnl = None
-                        for _p in state.get("positions", []):
-                            if _p.get("coin") == asset:
-                                _pnl = _p.get("pnl")
-                                break
-                        _try_record_close(asset, tr, exit_px, _pnl, "exit_rule_triggered")
-                        active_trades.remove(tr)
-                        save_active_trades()
-                        with open(diary_path, "a") as f:
-                            f.write(json.dumps({
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "asset": asset,
-                                "action": "exit_rule_triggered",
-                                "rule_reason": reason,
-                                "exit_rules": rules,
-                            }) + "\n")
-                    except Exception as ex:
-                        add_event(f"P2.2 exit close failed for {asset}: {ex}")
-                except Exception:
-                    continue
+                        rules = tr.get("exit_rules") or []
+                        asset = tr.get("asset")
+                        if not asset or not rules:
+                            continue
+                        msec = market_by_asset.get(asset)
+                        if not msec:
+                            continue  # no market data this cycle — cannot evaluate
+                        snap = build_snapshot(msec, current_price=msec.get("current_price"))
+                        should_exit, reason = evaluate_exit_rules(rules, snap)
+                        if not should_exit:
+                            continue
+                        add_event(f"P2.2 EXIT {asset}: {reason} — closing")
+                        try:
+                            amt = abs(float(tr.get("amount") or 0))
+                            if amt > 0:
+                                if tr.get("is_long"):
+                                    await hyperliquid.place_sell_order(asset, amt)
+                                else:
+                                    await hyperliquid.place_buy_order(asset, amt)
+                            await hyperliquid.cancel_all_orders(asset)
+                            risk_mgr.record_cooldown(asset, "exit_rule_triggered")
+                            # P2.5: record close before removing
+                            exit_px = msec.get("current_price")
+                            # find live pnl from state if available this cycle
+                            _pnl = None
+                            for _p in state.get("positions", []):
+                                if _p.get("coin") == asset:
+                                    _pnl = _p.get("pnl")
+                                    break
+                            _try_record_close(asset, tr, exit_px, _pnl, "exit_rule_triggered")
+                            active_trades.remove(tr)
+                            save_active_trades()
+                            with open(diary_path, "a") as f:
+                                f.write(json.dumps({
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "asset": asset,
+                                    "action": "exit_rule_triggered",
+                                    "rule_reason": reason,
+                                    "exit_rules": rules,
+                                }) + "\n")
+                        except Exception as ex:
+                            add_event(f"P2.2 exit close failed for {asset}: {ex}")
+                    except Exception:
+                        continue
 
             # Single LLM call with all assets
             context_payload = OrderedDict([

@@ -392,7 +392,7 @@ class HyperliquidAPI:
             return orders
         except (RuntimeError, ValueError, KeyError, ConnectionError) as e:
             logging.error("Get open orders error: %s", e)
-            return []
+            raise
 
     async def get_recent_fills(self, limit: int = 50):
         """Return the most recent fills when supported by the SDK variant.
