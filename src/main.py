@@ -1054,7 +1054,7 @@ def main():
                 pass
 
             # Execute trades for each asset
-            for output in outputs.get("trade_decisions", []) if isinstance(outputs, dict) else []:
+            for output in (outputs.get("trade_decisions", []) if isinstance(outputs, dict) else []) if cycle_state_healthy else []:
                 try:
                     asset = output.get("asset")
                     if not asset or asset not in args.assets:
