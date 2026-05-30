@@ -537,23 +537,25 @@ def main():
                                 except Exception as _e:
                                     rec_exit_unavailable = True
                                     logging.warning("P2.5.1: fill lookup failed for %s reconcile: %s", asset, _e)
-                                _try_record_close(asset, tr, rec_exit_price, rec_pnl, "reconcile_close")
-                                active_trades.remove(tr)
-                                save_active_trades()  # H5
-                                _diary_rec = {
-                                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                                    "asset": asset,
-                                    "action": "reconcile_close",
-                                    "reason": "no_position_no_orders",
-                                    "orphan_cycles": tr['_orphan_cycles'],
-                                    "opened_at": tr.get('opened_at'),
-                                    "exit_price": rec_exit_price,
-                                    "pnl": rec_pnl,
-                                }
-                                if rec_exit_unavailable:
-                                    _diary_rec["exit_data_unavailable"] = True
-                                with open(diary_path, "a") as f:
-                                    f.write(json.dumps(_diary_rec) + "\n")
+                                if not rec_exit_unavailable:
+                                    _try_record_close(asset, tr, rec_exit_price, rec_pnl, "reconcile_close")
+                                    active_trades.remove(tr)
+                                    save_active_trades()  # H5
+                                    _diary_rec = {
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "asset": asset,
+                                        "action": "reconcile_close",
+                                        "reason": "no_position_no_orders",
+                                        "orphan_cycles": tr['_orphan_cycles'],
+                                        "opened_at": tr.get('opened_at'),
+                                        "exit_price": rec_exit_price,
+                                        "pnl": rec_pnl,
+                                    }
+                                    with open(diary_path, "a") as f:
+                                        f.write(json.dumps(_diary_rec) + "\n")
+                                else:
+                                    add_event(f"Orphan {asset}: no close fills — NOT purging (likely stale fetch)")
+                                    tr['_orphan_cycles'] = 0
                             else:
                                 add_event(f"Tentative orphan for {asset} (cycle {tr['_orphan_cycles']}/{ORPHAN_CYCLES_REQUIRED}) — deferring reconcile")
                         else:
