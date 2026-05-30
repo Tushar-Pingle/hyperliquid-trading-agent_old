@@ -304,6 +304,14 @@ class TradingAgent:
 
         def _sanitize_output(raw_content: str, assets_list):
             """Use a cheap Claude model to normalize malformed output."""
+            # Strip markdown code fences before sanitizing
+            _cleaned = raw_content.strip()
+            if _cleaned.startswith("```"):
+                _nl = _cleaned.find("\n")
+                if _nl != -1:
+                    _cleaned = _cleaned[_nl + 1:]
+            if _cleaned.endswith("```"):
+                _cleaned = _cleaned[:-3].rstrip()
             try:
                 response = self.client.messages.create(
                     model=self.sanitize_model,
@@ -318,7 +326,7 @@ class TradingAgent:
                         f"Valid assets: {json.dumps(list(assets_list))}. "
                         "If input is wrapped in markdown or has prose, extract just the JSON. Do not add fields."
                     ),
-                    messages=[{"role": "user", "content": raw_content}],
+                    messages=[{"role": "user", "content": _cleaned}],
                 )
                 content = ""
                 for block in response.content:
@@ -329,8 +337,25 @@ class TradingAgent:
                     return parsed
                 return {"reasoning": "", "trade_decisions": []}
             except Exception as se:
-                logging.error("Sanitize failed: %s", se)
-                return {"reasoning": "", "trade_decisions": []}
+                logging.error("Sanitize failed: %s — degrading to all-hold", se)
+                return {
+                    "reasoning": "sanitize_failed",
+                    "trade_decisions": [
+                        {
+                            "asset": a,
+                            "action": "hold",
+                            "allocation_usd": 0.0,
+                            "order_type": "market",
+                            "limit_price": None,
+                            "tp_price": None,
+                            "sl_price": None,
+                            "exit_plan": "",
+                            "exit_rules": [],
+                            "rationale": "sanitize_failed",
+                        }
+                        for a in assets_list
+                    ],
+                }
 
         # Main loop: up to 6 iterations to handle tool calls
         for iteration in range(6):
