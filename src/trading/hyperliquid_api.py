@@ -404,6 +404,7 @@ class HyperliquidAPI:
             List of fill dictionaries or an empty list if unsupported.
         """
         try:
+            # user_fills returns account-wide fills; HIP-3 dex assets appear by coin name (no dex= param needed here)
             # Some SDK versions expose user_fills; fall back gracefully if absent
             if hasattr(self.info, 'user_fills'):
                 fills = await self._retry(lambda: self.info.user_fills(self.query_address))
