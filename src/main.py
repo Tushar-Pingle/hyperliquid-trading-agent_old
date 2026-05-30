@@ -565,6 +565,48 @@ def main():
                 except Exception:
                     pass
 
+            # Orphan adoption: adopt live exchange positions not tracked in active_trades
+            if cycle_state_healthy:
+                _tracked_assets = {tr.get('asset') for tr in active_trades}
+                for _pos in state.get('positions', []):
+                    try:
+                        _pos_coin = _pos.get('coin') or ''
+                        if not _pos_coin:
+                            continue
+                        _pos_szi = float(_pos.get('szi') or 0)
+                        _pos_entry = float(_pos.get('entryPx') or 0)
+                        if abs(_pos_szi) * _pos_entry < 1.0:
+                            continue  # dust position
+                        if _pos_coin in _tracked_assets:
+                            continue  # already tracked
+                        # Not tracked — adopt it
+                        _adopted_rec = {
+                            "asset": _pos_coin,
+                            "action": "buy" if _pos_szi > 0 else "sell",
+                            "is_long": _pos_szi > 0,
+                            "amount": abs(_pos_szi),
+                            "original_size": abs(_pos_szi),
+                            "entry_price": _pos_entry,
+                            "allocation_usd": abs(_pos_szi) * _pos_entry,
+                            "opened_at": datetime.now(timezone.utc).isoformat(),
+                            "_adopted": True,
+                        }
+                        active_trades.append(_adopted_rec)
+                        _tracked_assets.add(_pos_coin)
+                        risk_mgr.seed_cooldown(_pos_coin)
+                        save_active_trades()
+                        add_event(f"ADOPT: {_pos_coin} szi={_pos_szi:.6f} entry={_pos_entry:.4f} — untracked position adopted")
+                        with open(diary_path, "a") as f:
+                            f.write(json.dumps({
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "asset": _pos_coin,
+                                "action": "orphan_adopted",
+                                "szi": _pos_szi,
+                                "entry_price": _pos_entry,
+                            }) + "\n")
+                    except Exception as _adopt_err:
+                        add_event(f"ADOPT ERROR for {_pos.get('coin')}: {_adopt_err}")
+
             recent_fills_struct = []
             try:
                 fills = await hyperliquid.get_recent_fills(limit=50)
