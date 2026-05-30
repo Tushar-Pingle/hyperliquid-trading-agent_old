@@ -71,13 +71,15 @@ class RiskManager:
         self.min_rr = float(CONFIG.get("min_rr") or 1.5)
 
         # P2.7 — low-conviction volume gate
-        self.min_vol_spike_ratio = float(CONFIG.get("min_vol_spike_ratio") or 0.5)
+        self.min_vol_spike_ratio = float(CONFIG.get("min_vol_spike_ratio") or 0.3)
 
         # P3.2 — SL too-tight gate: R must be ≥ this fraction of ATR14_4h
         self.min_r_as_atr_fraction = float(CONFIG.get("min_r_as_atr_fraction") or 0.3)
 
         # P4.2 — hard-reject new entries in volatile regime
-        self.regime_gate_volatile = bool(CONFIG.get("regime_gate_volatile", True))
+        self.regime_gate_volatile = bool(CONFIG.get("regime_gate_volatile", False))
+        self.volatile_size_mult = float(CONFIG.get("volatile_size_mult") or 0.5)
+        self.vol_gate_hard = bool(CONFIG.get("vol_gate_hard", False))
 
         # P1.2 — per-asset cooldown
         self.cooldown_bars = int(CONFIG.get("cooldown_bars") or 3)
@@ -548,14 +550,23 @@ class RiskManager:
             return False, reason, trade
 
         # P4.2 — volatile-regime gate (after cheap memory checks, before data-dependent checks)
-        if self.regime_gate_volatile and regime_context:
-            if regime_context.get("regime") == "volatile" and not regime_context.get("stale"):
+        _volatile_size_mult = 1.0
+        if regime_context and regime_context.get("regime") == "volatile" and not regime_context.get("stale"):
+            if self.regime_gate_volatile:
                 return False, "regime_blocked_volatile", trade
+            else:
+                _volatile_size_mult = self.volatile_size_mult
+                logging.info("RISK P4.2: volatile regime — soft gate, applying size_mult=%.2f", _volatile_size_mult)
 
-        # P2.7 — low-conviction volume gate (block entries on dead tape)
+        # P2.7 — low-conviction volume gate
+        _vol_size_mult = 1.0
         ok, reason = self.check_volume_conviction(trade)
         if not ok:
-            return False, reason, trade
+            if self.vol_gate_hard:
+                return False, reason, trade
+            else:
+                _vol_size_mult = 0.5
+                logging.info("RISK P2.7: low vol conviction — soft gate, applying vol_size_mult=0.5")
 
         alloc_usd = float(trade.get("allocation_usd", 0))
         if alloc_usd <= 0:
@@ -587,6 +598,25 @@ class RiskManager:
                 )
                 alloc_usd = new_alloc
                 trade = {**trade, "allocation_usd": alloc_usd}
+
+        # Part C: apply conviction weighting + soft gate multipliers
+        _conviction = None
+        try:
+            _conviction_raw = trade.get("conviction")
+            if _conviction_raw is not None:
+                _conviction = max(0.1, min(1.0, float(_conviction_raw)))
+        except (TypeError, ValueError):
+            _conviction = None
+        if _conviction is not None:
+            alloc_usd = alloc_usd * _conviction
+            trade = {**trade, "allocation_usd": alloc_usd}
+            logging.info("RISK PartC: conviction=%.2f → alloc=$%.2f", _conviction, alloc_usd)
+        if _volatile_size_mult != 1.0:
+            alloc_usd = alloc_usd * _volatile_size_mult
+            trade = {**trade, "allocation_usd": alloc_usd}
+        if _vol_size_mult != 1.0:
+            alloc_usd = alloc_usd * _vol_size_mult
+            trade = {**trade, "allocation_usd": alloc_usd}
 
         # Hyperliquid minimum order size is $10
         if alloc_usd < 11.0:
