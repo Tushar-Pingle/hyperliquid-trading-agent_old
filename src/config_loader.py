@@ -127,6 +127,17 @@ CONFIG = {
     # abandon open positions to a possibly-supervisorless environment.
     "watchdog_restart_when_flat": _get_bool("WATCHDOG_RESTART_WHEN_FLAT", True),
 
+    # Phase 2 (2.6) — explicit isolated leverage per asset class (deterministic
+    # margin / liquidation / force-close distances).
+    "leverage_majors": _get_int("LEVERAGE_MAJORS", 3),
+    "leverage_hip3": _get_int("LEVERAGE_HIP3", 2),
+
+    # Phase 2 (2.5) — on a post-only entry timeout, optionally recover the missed
+    # (often momentum) entry with a capped-slippage IOC taker cross on MAJORS.
+    # Default OFF: preserves maker-only behavior; enable during the canary.
+    "entry_ioc_fallback": _get_bool("ENTRY_IOC_FALLBACK", False),
+    "entry_ioc_max_slippage": _get_env("ENTRY_IOC_MAX_SLIPPAGE", "0.003"),
+
     # P1.2 — per-asset cooldown
     "cooldown_bars": _get_env("COOLDOWN_BARS", "3"),           # bars of silence after any open/close/flip
 

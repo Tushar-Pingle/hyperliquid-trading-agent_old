@@ -310,6 +310,79 @@ class HyperliquidAPI:
         order_type = {"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}}
         return await self._retry(lambda: self.exchange.order(asset, not is_buy, amount, sl_price, order_type, True))
 
+    async def set_leverage(self, asset, leverage, is_cross=False):
+        """Phase 2 (2.6): set per-asset leverage (isolated by default).
+
+        The bot never set leverage on-exchange, so margin, liquidation price, and
+        the force-close distance all depended on whatever the account happened to
+        have configured. Best-effort — a failure is logged, not fatal.
+        """
+        try:
+            return await self._retry(
+                lambda: self.exchange.update_leverage(int(leverage), asset, is_cross)
+            )
+        except Exception as e:
+            logging.warning("set_leverage %s x%s (cross=%s) failed: %s", asset, leverage, is_cross, e)
+            return {"status": "error", "message": str(e)}
+
+    async def market_close(self, asset, is_long=None, size=None, slippage=0.01):
+        """Phase 2 (2.1): REDUCE-ONLY market close — a close that can never open.
+
+        The old close paths reused place_sell/buy_order (non-reduce-only
+        market_open), so a close computed from stale state could OPEN a naked
+        opposite position. This places a reduce-only IOC order that crosses the
+        book to fill immediately. reduce_only makes it doubly safe: in the right
+        direction it closes (capped to the position — an oversized size just
+        closes fully, never flips); in the wrong direction it is a no-op.
+
+        Args:
+            asset: market symbol.
+            is_long: side of the position being closed. If None (with size None),
+                the live position is fetched to determine side and full size.
+            size: contracts to close. None -> the full live position size.
+            slippage: marketable cross as a fraction of mid.
+        """
+        # Resolve side/size from the LIVE position when not fully specified —
+        # never trust a caller's possibly-stale size for the full-close case.
+        if is_long is None or size is None:
+            try:
+                state = await self.get_user_state()
+            except Exception as e:
+                logging.error("market_close %s: state fetch failed: %s", asset, e)
+                return {"status": "error", "message": str(e)}
+            a_bare = asset.split(":", 1)[1] if ":" in asset else asset
+            pos = None
+            for p in state.get("positions", []):
+                pc = p.get("coin") or ""
+                if pc == asset or pc == a_bare or (":" in pc and pc.split(":", 1)[1] == a_bare):
+                    pos = p
+                    break
+            if pos is None:
+                return {"status": "noop", "reason": "no_position"}
+            try:
+                szi = float(pos.get("szi") or 0)
+            except (TypeError, ValueError):
+                szi = 0.0
+            if szi == 0:
+                return {"status": "noop", "reason": "flat"}
+            if is_long is None:
+                is_long = szi > 0
+            if size is None:
+                size = abs(szi)
+        size = self.round_size(asset, abs(size))
+        if size <= 0:
+            return {"status": "noop", "reason": "zero_size"}
+        px = await self.get_current_price(asset)
+        if not px:
+            return {"status": "error", "message": "no_price"}
+        is_buy = not is_long  # close a long by selling; close a short by buying
+        limit_px = px * (1 + slippage) if is_buy else px * (1 - slippage)
+        limit_px = self.round_price(asset, limit_px)
+        order_type = {"limit": {"tif": "Ioc"}}
+        return await self._retry(
+            lambda: self.exchange.order(asset, is_buy, size, limit_px, order_type, True)
+        )
+
     async def cancel_order(self, asset, oid):
         """Cancel a single order by identifier for a given asset.
 
