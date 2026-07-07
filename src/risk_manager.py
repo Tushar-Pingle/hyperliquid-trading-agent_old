@@ -512,7 +512,8 @@ class RiskManager:
 
     def validate_trade(self, trade: dict, account_state: dict,
                         initial_balance: float,
-                        regime_context: dict | None = None) -> tuple[bool, str, dict]:
+                        regime_context: dict | None = None,
+                        skip_cooldown: bool = False) -> tuple[bool, str, dict]:
         """Run all safety checks on a proposed trade.
 
         Args:
@@ -523,6 +524,10 @@ class RiskManager:
             initial_balance: Starting balance for reserve check
             regime_context: Optional regime brief for this asset (P4.2).
                 Keys: regime, vol_regime, stale, etc.
+            skip_cooldown: Phase 2 (2.4) — bypass the cooldown gate for a flip
+                re-entry. The flip just closed the opposite side in the SAME
+                cycle; blocking its re-entry on the cooldown that close created
+                is the self-defeating-flip bug (paid fees to go flat 10/10 times).
 
         Returns:
             (allowed, reason, adjusted_trade)
@@ -538,9 +543,10 @@ class RiskManager:
         now = datetime.now(timezone.utc)
 
         # P1.2 — cooldown check (before any other guard; exits bypass this)
-        ok, reason = self.check_cooldown(coin, now)
-        if not ok:
-            return False, reason, trade
+        if not skip_cooldown:
+            ok, reason = self.check_cooldown(coin, now)
+            if not ok:
+                return False, reason, trade
 
         # P1.1 — stacking guard (hard block, no scale-in carve-out)
         ok, reason = self.check_stacking(coin, is_buy, positions)

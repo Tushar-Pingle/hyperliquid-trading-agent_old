@@ -22,6 +22,12 @@ from aiohttp import web
 from src.utils.formatting import format_number as fmt, format_size as fmt_sz
 from src.utils.prompt_utils import json_default, round_or_none, round_series
 from src.regime_analyzer import refresh_regime
+from src.notify import notify
+from src.fills import (
+    newest_fills, fill_is_buy, fill_coin_matches, fill_time_ms,
+    realized_from_fills, classify_fill, attribute_position_fills,
+)
+from src.execution import compute_bracket_prices
 
 load_dotenv()
 
@@ -58,6 +64,21 @@ def get_interval_seconds(interval_str):
         return int(interval_str[:-1]) * 86400
     else:
         raise ValueError(f"Unsupported interval: {interval_str}")
+
+
+def _git_sha() -> str:
+    """Best-effort short git SHA for the startup fingerprint (Phase 0 0.7)."""
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(pathlib.Path(__file__).parent.parent),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
 
 def main():
     """Parse CLI args, bootstrap dependencies, and launch the trading loop."""
@@ -102,6 +123,31 @@ def main():
             args.interval, interval_sec,
         )
 
+    # Phase 0 (0.7) — immutable startup fingerprint. The last run had 23
+    # undocumented restarts whose config had to be reverse-engineered from log
+    # gaps; log it once, plainly, on every boot.
+    _fingerprint = {
+        "git_sha": _git_sha(),
+        "model": CONFIG.get("llm_model"),
+        "sanitize_model": CONFIG.get("sanitize_model"),
+        "network": CONFIG.get("hyperliquid_network"),
+        "assets": args.assets,
+        "interval": args.interval,
+        "api_host": CONFIG.get("api_host"),
+        "thinking_enabled": CONFIG.get("thinking_enabled"),
+        "enable_tool_calling": CONFIG.get("enable_tool_calling"),
+        "regime_gate_volatile": CONFIG.get("regime_gate_volatile"),
+        "partial_tp_enabled": CONFIG.get("partial_tp_enabled"),
+        "trailing_stop_enabled": CONFIG.get("trailing_stop_enabled"),
+        "perf_memory_enabled": CONFIG.get("perf_memory_enabled"),
+        "alerts_configured": bool(CONFIG.get("alert_webhook_url")),
+    }
+    logging.info("STARTUP FINGERPRINT: %s", json.dumps(_fingerprint))
+    if not CONFIG.get("alert_webhook_url"):
+        logging.warning(
+            "Phase 0 (0.6): ALERT_WEBHOOK_URL is not set — operator alerts will "
+            "only be logged, not pushed. Set it before running live."
+        )
 
     start_time = datetime.now(timezone.utc)
     invocation_count = 0
@@ -150,10 +196,15 @@ def main():
             logging.warning("P2.5: write_trade_log failed (non-fatal): %s", e)
 
     def _try_record_close(asset, active_tr, exit_price, pnl, close_reason,
-                           margin=None, leverage=None, leverage_fallback=False):
+                           margin=None, leverage=None, leverage_fallback=False,
+                           fees_paid=None, gross_pnl=None, pnl_basis="gross"):
         """Best-effort helper to record a close. Pulls entry / size / opened_at
         from the matching active_trade record when present so the close site
         only has to supply what it directly knows.
+
+        Phase 1 (1.4): records net PnL plus its components (gross_pnl, fees_paid)
+        and the tp/sl oids, so trade_log rows are auditable and pnl can be
+        reconstructed. A null pnl on a fill-backed close is an anomaly, not noise.
         """
         try:
             entry_price = None
@@ -184,12 +235,20 @@ def main():
                 "entry_price": entry_price,
                 "exit_price": exit_price,
                 "size": size,
-                "pnl": pnl,
+                "pnl": pnl,                       # net of fees when fill-derived (1.4)
+                "pnl_basis": pnl_basis,           # 'net_of_fees' (reconcile) | 'gross' | 'unavailable'
+                "gross_pnl": gross_pnl,           # exchange closedPnl before fees
+                "fees_paid": fees_paid,           # entry + exit fees (1.4)
                 "margin": margin,
                 "leverage": leverage,
                 "leverage_fallback": leverage_fallback,
                 "duration_sec": duration_sec,
                 "close_reason": close_reason,
+                # oid_chain for audit (1.4)
+                "tp_oid": active_tr.get("tp_oid") if isinstance(active_tr, dict) else None,
+                "tp1_oid": active_tr.get("tp1_oid") if isinstance(active_tr, dict) else None,
+                "tp2_oid": active_tr.get("tp2_oid") if isinstance(active_tr, dict) else None,
+                "sl_oid": active_tr.get("sl_oid") if isinstance(active_tr, dict) else None,
             })
         except Exception as e:
             logging.warning("P2.5: _try_record_close failed (non-fatal): %s", e)
@@ -229,6 +288,22 @@ def main():
         for dex in hip3_dexes:
             await hyperliquid.get_meta_and_ctxs(dex=dex)
             add_event(f"Loaded HIP-3 meta for dex: {dex}")
+
+        # Phase 2 (2.6): set explicit isolated leverage per asset so margin,
+        # liquidation price, and the force-close distance are deterministic
+        # (previously never set → whatever the account happened to have).
+        _lev_majors = int(CONFIG.get("leverage_majors") or 3)
+        _lev_hip3 = int(CONFIG.get("leverage_hip3") or 2)
+        for a in args.assets:
+            _lev = _lev_hip3 if ":" in a else _lev_majors
+            try:
+                _lr = await hyperliquid.set_leverage(a, _lev, is_cross=False)
+                if isinstance(_lr, dict) and _lr.get("status") == "error":
+                    add_event(f"2.6: set leverage {a} x{_lev} isolated failed (non-fatal): {_lr.get('message')}")
+                else:
+                    add_event(f"2.6: leverage {a} = {_lev}x isolated")
+            except Exception as _le:
+                add_event(f"2.6: set leverage {a} failed (non-fatal): {_le}")
 
         # P2.5: Load trade-log history for Sharpe computation
         load_trade_log()
@@ -281,6 +356,37 @@ def main():
         except Exception as _seed_err:
             add_event(f"P1.2: cooldown seed error (non-fatal): {_seed_err}")
 
+        # Phase 0 (0.7) — startup equity/position fingerprint + alert
+        try:
+            _boot_state = await hyperliquid.get_user_state()
+            _boot_pos = [
+                p.get('coin') for p in _boot_state.get('positions', [])
+                if abs(float(p.get('szi') or 0)) > 0
+            ]
+            _boot_eq = _boot_state.get('total_value')
+            add_event(f"BOOT: equity=${round_or_none(_boot_eq, 2)} open_positions={_boot_pos or 'none'}")
+            notify(
+                f"Bot started · equity=${round_or_none(_boot_eq, 2)} · "
+                f"positions={_boot_pos or 'none'} · model={CONFIG.get('llm_model')}",
+                level="info",
+            )
+        except Exception as _be:
+            add_event(f"BOOT: equity fingerprint failed: {_be}")
+
+        # Phase 0 watchdog / spend / equity-sanity state (loop-scoped)
+        error_hold_streak = 0                       # 0.4: consecutive LLM error-holds
+        alert_after = int(CONFIG.get("error_hold_alert_after") or 3)
+        restart_after = int(CONFIG.get("error_hold_restart_after") or 8)
+        last_known_equity = None                    # 0.8: last GOOD equity
+        suspect_equity_streak = 0                   # 0.8: consecutive suspect reads
+        equity_dev_pct = float(CONFIG.get("equity_sanity_deviation_pct") or 50)
+        equity_suspect_adopt_after = int(CONFIG.get("equity_suspect_adopt_after") or 4)
+        watchdog_restart_when_flat = bool(CONFIG.get("watchdog_restart_when_flat", True))
+        daily_spend = {}                            # 0.5: {UTC-date: usd}
+        daily_spend_alerted = set()
+        daily_spend_limit = float(CONFIG.get("llm_daily_spend_alert_usd") or 1.0)
+        untracked_alerted = set()                   # 1.5: bare coins already paged as untracked
+
         while True:
             invocation_count += 1
             minutes_since_start = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
@@ -310,6 +416,11 @@ def main():
             sharpe = calculate_sharpe(trade_log)
 
             account_value = total_value
+
+            # Phase 0 (0.8): the equity-sanity guard is applied LOWER DOWN, just
+            # before the LLM/new-entry section — so a suspect read gates only NEW
+            # entries, while LLM-independent protective management (force-close,
+            # SL/exit-rules, trailing) below still runs this cycle.
             if initial_account_value is None:
                 initial_account_value = account_value
             total_return_pct = ((account_value - initial_account_value) / initial_account_value * 100.0) if initial_account_value else 0.0
@@ -343,10 +454,9 @@ def main():
                         f"{' [fallback]' if ptc.get('leverage_fallback') else ''})"
                     )
                     try:
-                        if is_long:
-                            await hyperliquid.place_sell_order(coin, size)
-                        else:
-                            await hyperliquid.place_buy_order(coin, size)
+                        # Phase 2 (2.1): reduce-only close — cannot open an opposite
+                        # position even if size/side are slightly stale.
+                        await hyperliquid.market_close(coin, is_long=is_long, size=size)
                         await hyperliquid.cancel_all_orders(coin)
                         risk_mgr.record_cooldown(coin, "force_close")  # P1.2
                         # Remove from active trades + record to trade log (P2.5)
@@ -397,10 +507,8 @@ def main():
                         continue
                     add_event(f"S2 WEEKEND CLOSE: {coin} (size={size}) — HIP-3 oracle frozen window")
                     try:
-                        if size > 0:
-                            await hyperliquid.place_sell_order(coin, abs(size))
-                        else:
-                            await hyperliquid.place_buy_order(coin, abs(size))
+                        # Phase 2 (2.1): reduce-only close.
+                        await hyperliquid.market_close(coin, is_long=(size > 0), size=abs(size))
                         await hyperliquid.cancel_all_orders(coin)
                         risk_mgr.record_cooldown(coin, "weekend_close")  # P1.2
                         matched_tr = None
@@ -442,7 +550,7 @@ def main():
                     open_orders_struct.append({
                         "coin": o.get('coin'),
                         "oid": o.get('oid'),
-                        "is_buy": o.get('isBuy'),
+                        "is_buy": fill_is_buy(o),  # orders carry side/dir, not isBuy
                         "size": round_or_none(o.get('sz'), 6),
                         "price": round_or_none(o.get('px'), 2),
                         "trigger_price": round_or_none(o.get('triggerPx'), 2),
@@ -466,6 +574,29 @@ def main():
                     except Exception:
                         continue
                 assets_with_orders = {o.get('coin') for o in (open_orders or []) if o.get('coin')}
+
+                # Phase 1 (1.5): cycle-start invariant — a position on the exchange
+                # that NO active_trade tracks is UNMANAGED by our TP/SL/exit-rules
+                # (this is the "2 live positions, active_trades.json=[]" end-state
+                # from the audit). Page the operator once per asset until adopted.
+                def _bare(a):
+                    return a.split(':', 1)[1] if a and ':' in a else a
+                _tracked_bare = {_bare(tr.get('asset')) for tr in active_trades}
+                for _pcoin in assets_with_positions:
+                    if _bare(_pcoin) not in _tracked_bare:
+                        if _pcoin not in untracked_alerted:
+                            untracked_alerted.add(_pcoin)
+                            _m = (f"INVARIANT: exchange position on {_pcoin} is UNTRACKED "
+                                  f"(no active_trade) — unmanaged by TP/SL/exit-rules. "
+                                  f"Investigate/adopt.")
+                            add_event(_m)
+                            notify(_m, level="critical")
+                    else:
+                        untracked_alerted.discard(_pcoin)
+                for _a in list(untracked_alerted):
+                    if _a not in assets_with_positions:
+                        untracked_alerted.discard(_a)
+
                 ORPHAN_CYCLES_REQUIRED = 2
                 for tr in active_trades[:]:
                     asset = tr.get('asset')
@@ -473,52 +604,61 @@ def main():
                         tr['_orphan_cycles'] = tr.get('_orphan_cycles', 0) + 1
                         if tr['_orphan_cycles'] >= ORPHAN_CYCLES_REQUIRED:
                             add_event(f"Reconciling stale active trade for {asset} (orphan for {tr['_orphan_cycles']} cycles)")
-                            # P2.5.1: recover exit price/pnl from exchange fills so
-                            # trade_log records have real numbers instead of null.
+                            # Phase 1 (1.2/1.4): recover REAL exit price + net PnL +
+                            # fees from the position's OWN fills. Attribution is by
+                            # the trade's exit-order oids (globally unique), so a
+                            # prior/adjacent same-asset trade can't leak in; a
+                            # closing fill is REQUIRED before recording a close.
                             rec_exit_price = None
                             rec_pnl = None
+                            rec_gross = None
+                            rec_fees = None
                             rec_exit_unavailable = False
-                            try:
-                                rec_fills = await hyperliquid.get_recent_fills(limit=100)
-                                opened_ts_ms = 0
-                                if tr.get('opened_at'):
-                                    try:
-                                        opened_ts_ms = int(datetime.fromisoformat(
-                                            str(tr['opened_at']).replace('Z', '+00:00')
-                                        ).timestamp() * 1000)
-                                    except Exception:
-                                        pass
-                                is_long = tr.get('is_long')
-                                close_fills = []
-                                for _f in rec_fills:
-                                    f_coin = _f.get('coin') or _f.get('asset') or ''
-                                    # Match asset name; strip HIP-3 prefix (xyz:CL → CL)
-                                    if f_coin != asset:
-                                        if not (':' in asset and asset.split(':', 1)[1] == f_coin):
-                                            continue
-                                    f_time = int(_f.get('time') or _f.get('timestamp') or 0)
-                                    if f_time < opened_ts_ms:
-                                        continue
-                                    f_is_buy = _f.get('isBuy')
-                                    # Close of a long = sell fill; close of a short = buy fill
-                                    if is_long is True and f_is_buy is True:
-                                        continue
-                                    if is_long is False and f_is_buy is False:
-                                        continue
-                                    close_fills.append(_f)
-                                if close_fills:
-                                    close_fills.sort(key=lambda _f: int(_f.get('time') or 0))
-                                    rec_exit_price = float(close_fills[-1].get('px') or 0) or None
-                                    pnl_parts = [float(_f['closedPnl']) for _f in close_fills
-                                                 if _f.get('closedPnl') is not None]
-                                    rec_pnl = sum(pnl_parts) if pnl_parts else None
-                                else:
-                                    rec_exit_unavailable = True
-                                    add_event(f"No matching close fills found for {asset} reconcile; pnl stays null")
-                            except Exception as _e:
+                            opened_ts_ms = 0
+                            if tr.get('opened_at'):
+                                try:
+                                    opened_ts_ms = int(datetime.fromisoformat(
+                                        str(tr['opened_at']).replace('Z', '+00:00')
+                                    ).timestamp() * 1000)
+                                except Exception:
+                                    opened_ts_ms = 0
+                            if not opened_ts_ms:
+                                # No parseable open time → we cannot bound the fill
+                                # window safely; don't aggregate an unbounded history.
                                 rec_exit_unavailable = True
-                                logging.warning("P2.5.1: fill lookup failed for %s reconcile: %s", asset, _e)
-                            _try_record_close(asset, tr, rec_exit_price, rec_pnl, "reconcile_close")
+                            else:
+                                try:
+                                    _wfills = await hyperliquid.get_fills_since(max(0, opened_ts_ms - 120_000))
+                                    trade_fills = attribute_position_fills(_wfills, tr, opened_ts_ms)
+                                    _agg = realized_from_fills(trade_fills)
+                                    if _agg.get("has_close"):
+                                        rec_exit_price = _agg["exit_px"]
+                                        rec_pnl = _agg["net_pnl"]
+                                        rec_gross = _agg["gross_pnl"]
+                                        rec_fees = _agg["fees"]
+                                        add_event(
+                                            f"Reconcile {asset}: net_pnl=${round_or_none(rec_pnl, 4)} "
+                                            f"(gross=${round_or_none(rec_gross, 4)}, fees=${round_or_none(rec_fees, 4)}) "
+                                            f"from {_agg['n_fills']} fill(s), exit=${round_or_none(rec_exit_price, 4)}"
+                                        )
+                                    else:
+                                        # No closing fill attributable → do NOT record a
+                                        # synthetic breakeven close; treat as unavailable.
+                                        rec_exit_unavailable = True
+                                except Exception as _e:
+                                    rec_exit_unavailable = True
+                                    logging.warning("Phase1: fill lookup failed for %s reconcile: %s", asset, _e)
+                            if rec_exit_unavailable:
+                                # pnl=null must NOT be routine — a position vanished
+                                # and we can't explain where. Alert; do not silently
+                                # corrupt performance memory (1.5/1.6).
+                                _m = (f"Reconcile {asset}: position gone but no attributable close fill — "
+                                      f"pnl unrecoverable. Investigate (manual close? fills API lag? re-entry?).")
+                                add_event(_m)
+                                notify(_m, level="warn")
+                            _try_record_close(asset, tr, rec_exit_price, rec_pnl, "reconcile_close",
+                                              fees_paid=rec_fees, gross_pnl=rec_gross,
+                                              pnl_basis=("net_of_fees" if not rec_exit_unavailable else "unavailable"))
                             active_trades.remove(tr)
                             save_active_trades()  # H5
                             _diary_rec = {
@@ -530,6 +670,8 @@ def main():
                                 "opened_at": tr.get('opened_at'),
                                 "exit_price": rec_exit_price,
                                 "pnl": rec_pnl,
+                                "gross_pnl": rec_gross,
+                                "fees_paid": rec_fees,
                             }
                             if rec_exit_unavailable:
                                 _diary_rec["exit_data_unavailable"] = True
@@ -546,8 +688,10 @@ def main():
 
             recent_fills_struct = []
             try:
-                fills = await hyperliquid.get_recent_fills(limit=50)
-                for f_entry in fills[-20:]:
+                # Phase 1 (1.1): get_recent_fills now returns NEWEST-first, so take
+                # the leading 20 (was [-20:], which grabbed the oldest); and read
+                # direction via fill_is_buy (raw fills carry side/dir, not isBuy).
+                for f_entry in newest_fills(await hyperliquid.get_recent_fills(limit=50), 20):
                     try:
                         t_raw = f_entry.get('time') or f_entry.get('timestamp')
                         timestamp = None
@@ -563,9 +707,11 @@ def main():
                         recent_fills_struct.append({
                             "timestamp": timestamp,
                             "coin": f_entry.get('coin') or f_entry.get('asset'),
-                            "is_buy": f_entry.get('isBuy'),
+                            "is_buy": fill_is_buy(f_entry),
                             "size": round_or_none(f_entry.get('sz') or f_entry.get('size'), 6),
-                            "price": round_or_none(f_entry.get('px') or f_entry.get('price'), 2)
+                            "price": round_or_none(f_entry.get('px') or f_entry.get('price'), 2),
+                            "closed_pnl": round_or_none(f_entry.get('closedPnl'), 4),
+                            "fee": round_or_none(f_entry.get('fee'), 5),
                         })
                     except Exception:
                         continue
@@ -750,14 +896,13 @@ def main():
                         # Belt-and-suspenders: size should also have dropped
                         if _p32_live_sz > _p32_exp_rem * 1.1:
                             continue  # TP1 fill seen but size hasn't settled — skip this cycle
-                        # TP1 has filled — cancel old SL and place breakeven SL
+                        # TP1 has filled — move SL to breakeven. Phase 2 (2.3):
+                        # PLACE the new SL FIRST, then cancel the old one, so there
+                        # is never a zero-stop window; and only mark tp1_filled once
+                        # the new SL is live (else keep the old SL — reduce-only, so
+                        # it still protects the remainder — and retry next cycle).
                         _p32_entry = float(tr.get('entry_price') or 0)
                         _p32_old_sl = tr.get('sl_oid')
-                        try:
-                            if _p32_old_sl:
-                                await hyperliquid.cancel_order(_p32_asset, _p32_old_sl)
-                        except Exception as _p32_ce:
-                            add_event(f"P3.2: cancel SL for breakeven failed {_p32_asset}: {_p32_ce}")
                         _p32_new_sl_oid = None
                         _p32_rem = max(_p32_live_sz, _p32_exp_rem)
                         if _p32_entry > 0 and _p32_rem > 0:
@@ -769,11 +914,24 @@ def main():
                                 _p32_new_sl_oid = _p32_be_oids[0] if _p32_be_oids else None
                             except Exception as _p32_be_err:
                                 add_event(f"P3.2: breakeven SL placement failed {_p32_asset}: {_p32_be_err}")
-                        tr['tp1_filled'] = True
-                        tr['remaining_size'] = _p32_live_sz
+                        tr['remaining_size'] = _p32_live_sz  # size dropped either way
                         if _p32_new_sl_oid:
+                            # new SL is live → safe to cancel the old one now
+                            if _p32_old_sl:
+                                try:
+                                    await hyperliquid.cancel_order(_p32_asset, _p32_old_sl)
+                                except Exception as _p32_ce:
+                                    add_event(f"P3.2: cancel old SL after breakeven failed {_p32_asset}: {_p32_ce}")
                             tr['sl_oid'] = _p32_new_sl_oid
                             tr['current_sl_price'] = _p32_entry
+                            tr['tp1_filled'] = True
+                        else:
+                            # keep the OLD SL (still reduce-only-protects the remainder);
+                            # do NOT set tp1_filled → breakeven retried next cycle.
+                            _m = (f"P3.2 {_p32_asset}: breakeven SL not placed — keeping old SL "
+                                  f"(oid={_p32_old_sl}); will retry.")
+                            add_event(_m)
+                            notify(_m, level="warn")
                         save_active_trades()
                         add_event(
                             f"P3.2 tp1_hit: {_p32_asset} — "
@@ -844,50 +1002,56 @@ def main():
                         _t_is_tighter = (_t_new_sl > _t_cur_sl) if _t_long else (_t_new_sl < _t_cur_sl)
                         if not _t_is_tighter:
                             continue
-                        # Cancel old SL and place tighter trailing SL
+                        # Phase 2 (2.3): PLACE the tighter trailing SL FIRST, then
+                        # cancel the old one — never a zero-stop window. On failure
+                        # keep the existing SL (the old "cancel then place" left the
+                        # position unprotected and then LOGGED "keeping old" — a lie).
                         _t_old_oid = tr.get('sl_oid')
                         _t_sl_sz = float(tr.get('remaining_size') or tr.get('amount') or 0)
                         if _t_sl_sz <= 0:
                             continue
-                        try:
-                            if _t_old_oid:
-                                await hyperliquid.cancel_order(_t_asset, _t_old_oid)
-                        except Exception as _t_ce:
-                            add_event(f"P3.1: cancel old SL failed {_t_asset}: {_t_ce}")
+                        _t_new_oid = None
                         try:
                             _t_sl_res = await hyperliquid.place_stop_loss(
                                 _t_asset, _t_long, _t_sl_sz, _t_new_sl
                             )
                             _t_new_oids = hyperliquid.extract_oids(_t_sl_res)
                             _t_new_oid = _t_new_oids[0] if _t_new_oids else None
-                            if _t_new_oid:
-                                _t_was_trailing = tr.get('trailing_active', False)
-                                tr['sl_oid'] = _t_new_oid
-                                tr['current_sl_price'] = _t_new_sl
-                                tr['trailing_active'] = True
-                                save_active_trades()
-                                _t_lbl = "trailing_activated" if not _t_was_trailing else "trailing_updated"
-                                add_event(
-                                    f"P3.1 {_t_lbl}: {_t_asset} SL → {_t_new_sl:.4f} "
-                                    f"(peak={_t_peak:.4f} ATR={_t_atr:.4f} "
-                                    f"R_mult={_t_profit / _t_orig_risk:.2f})"
-                                )
-                                with open(diary_path, "a") as f:
-                                    f.write(json.dumps({
-                                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                                        "asset": _t_asset,
-                                        "action": _t_lbl,
-                                        "new_sl": round_or_none(_t_new_sl, 6),
-                                        "peak_price": round_or_none(_t_peak, 6),
-                                        "atr14_4h": round_or_none(_t_atr, 6),
-                                        "profit_r": round_or_none(_t_profit / _t_orig_risk, 3),
-                                    }) + "\n")
-                            else:
-                                add_event(
-                                    f"P3.1 WARNING: trailing SL for {_t_asset} returned no oid — keeping old"
-                                )
                         except Exception as _t_pe:
-                            add_event(f"P3.1: place trailing SL failed {_t_asset}: {_t_pe} — keeping old")
+                            add_event(f"P3.1: place trailing SL failed {_t_asset}: {_t_pe} — keeping existing SL")
+                        if _t_new_oid:
+                            # new SL is live → now safe to cancel the old one
+                            if _t_old_oid:
+                                try:
+                                    await hyperliquid.cancel_order(_t_asset, _t_old_oid)
+                                except Exception as _t_ce:
+                                    add_event(f"P3.1: cancel old SL after trailing failed {_t_asset}: {_t_ce}")
+                            _t_was_trailing = tr.get('trailing_active', False)
+                            tr['sl_oid'] = _t_new_oid
+                            tr['current_sl_price'] = _t_new_sl
+                            tr['trailing_active'] = True
+                            save_active_trades()
+                            _t_lbl = "trailing_activated" if not _t_was_trailing else "trailing_updated"
+                            add_event(
+                                f"P3.1 {_t_lbl}: {_t_asset} SL → {_t_new_sl:.4f} "
+                                f"(peak={_t_peak:.4f} ATR={_t_atr:.4f} "
+                                f"R_mult={_t_profit / _t_orig_risk:.2f})"
+                            )
+                            with open(diary_path, "a") as f:
+                                f.write(json.dumps({
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "asset": _t_asset,
+                                    "action": _t_lbl,
+                                    "new_sl": round_or_none(_t_new_sl, 6),
+                                    "peak_price": round_or_none(_t_peak, 6),
+                                    "atr14_4h": round_or_none(_t_atr, 6),
+                                    "profit_r": round_or_none(_t_profit / _t_orig_risk, 3),
+                                }) + "\n")
+                        else:
+                            add_event(
+                                f"P3.1 WARNING: trailing SL for {_t_asset} not placed — "
+                                f"keeping existing SL (oid={_t_old_oid})"
+                            )
                     except Exception:
                         continue
 
@@ -906,12 +1070,11 @@ def main():
                         continue
                     add_event(f"P2.2 EXIT {asset}: {reason} — closing")
                     try:
-                        amt = abs(float(tr.get("amount") or 0))
-                        if amt > 0:
-                            if tr.get("is_long"):
-                                await hyperliquid.place_sell_order(asset, amt)
-                            else:
-                                await hyperliquid.place_buy_order(asset, amt)
+                        # Phase 2 (2.1): reduce-only close of the FULL LIVE position.
+                        # Fixes the D3 bug where this used the ORIGINAL size after a
+                        # TP1 partial fill and thus sold ~2x the remaining position,
+                        # opening a naked opposite. reduce-only + live size = safe.
+                        await hyperliquid.market_close(asset, is_long=tr.get("is_long"))
                         await hyperliquid.cancel_all_orders(asset)
                         risk_mgr.record_cooldown(asset, "exit_rule_triggered")
                         # P2.5: record close before removing
@@ -937,6 +1100,38 @@ def main():
                         add_event(f"P2.2 exit close failed for {asset}: {ex}")
                 except Exception:
                     continue
+
+            # Phase 0 (0.8): equity-sanity guard — gates NEW ENTRIES only (all
+            # protective management above has already run this cycle). Do NOT
+            # adopt the suspect value into last_known_equity (a persistent glitch
+            # would otherwise become the baseline and we'd size on garbage); keep
+            # the last GOOD value and only adopt after the read has persisted for
+            # N cycles (then it is almost certainly a real deposit/withdrawal).
+            if last_known_equity is not None and last_known_equity > 1.0:
+                _dev = abs(account_value - last_known_equity) / last_known_equity * 100.0
+                if _dev > equity_dev_pct:
+                    suspect_equity_streak += 1
+                    if suspect_equity_streak >= equity_suspect_adopt_after:
+                        _m = (f"Equity sanity: ${round_or_none(account_value, 2)} persisted "
+                              f"{suspect_equity_streak} cycles ({round(_dev, 1)}% vs "
+                              f"${round_or_none(last_known_equity, 2)}) — adopting as real; resuming.")
+                        add_event(_m)
+                        notify(_m, level="warn")
+                        last_known_equity = account_value
+                        suspect_equity_streak = 0
+                    else:
+                        _m = (f"Equity sanity: read ${round_or_none(account_value, 2)} deviates "
+                              f"{round(_dev, 1)}% from last-known ${round_or_none(last_known_equity, 2)} "
+                              f"— skipping NEW ENTRIES (suspect read; protective mgmt already ran).")
+                        add_event(_m)
+                        notify(_m, level="warn")
+                        await asyncio.sleep(get_interval_seconds(args.interval))
+                        continue
+                else:
+                    suspect_equity_streak = 0
+                    last_known_equity = account_value
+            else:
+                last_known_equity = account_value
 
             # Single LLM call with all assets
             context_payload = OrderedDict([
@@ -975,8 +1170,14 @@ def main():
                 except Exception:
                     return True
 
+            _spend_before = agent.cumulative_spend_usd  # Phase 0 (0.5)
             try:
-                outputs = agent.decide_trade(args.assets, context, has_active_trades=bool(active_trades))
+                # Phase 2 (2.7): offload the synchronous Claude call to a thread so
+                # the event loop (exit management, trailing, watchdog, HTTP server)
+                # keeps running during the multi-second decision latency.
+                outputs = await asyncio.to_thread(
+                    agent.decide_trade, args.assets, context, bool(active_trades)
+                )
                 if not isinstance(outputs, dict):
                     add_event(f"Invalid output format (expected dict): {outputs}")
                     outputs = {}
@@ -995,7 +1196,9 @@ def main():
                 ])
                 context_retry = json.dumps(context_retry_payload, default=json_default)
                 try:
-                    outputs = agent.decide_trade(args.assets, context_retry, has_active_trades=bool(active_trades))
+                    outputs = await asyncio.to_thread(
+                        agent.decide_trade, args.assets, context_retry, bool(active_trades)
+                    )
                     if not isinstance(outputs, dict):
                         add_event(f"Retry invalid format: {outputs}")
                         outputs = {}
@@ -1004,6 +1207,18 @@ def main():
                     add_event(f"Retry agent error: {e}")
                     add_event(f"Retry traceback: {traceback.format_exc()}")
                     outputs = {}
+
+            # Phase 0 (0.5): cost of this cycle's LLM calls (primary + retry + sanitize)
+            cycle_cost = round(agent.cumulative_spend_usd - _spend_before, 6)
+            _day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            daily_spend[_day] = daily_spend.get(_day, 0.0) + cycle_cost
+            if daily_spend[_day] > daily_spend_limit and _day not in daily_spend_alerted:
+                daily_spend_alerted.add(_day)
+                notify(
+                    f"LLM daily spend ${round(daily_spend[_day], 3)} exceeded "
+                    f"${daily_spend_limit} on {_day} UTC.",
+                    level="warn",
+                )
 
             reasoning_text = outputs.get("reasoning", "") if isinstance(outputs, dict) else ""
             if reasoning_text:
@@ -1018,6 +1233,21 @@ def main():
                     "allocation_usd": d.get("allocation_usd", 0),
                     "rationale": d.get("rationale", ""),
                 })
+            # Phase 0 (0.4): a cycle is a degenerate "error-hold" if the agent
+            # tagged it (api_error/empty/tool_loop) OR it produced no decisions at
+            # all (an unhandled exception left outputs={} — also a hard failure).
+            if isinstance(outputs, dict) and outputs.get("error"):
+                _err_reason = outputs.get("error")
+            elif not isinstance(outputs, dict) or not outputs.get("trade_decisions"):
+                _err_reason = "agent_exception"
+            elif _is_failed_outputs(outputs):
+                # All-holds-with-'parse error' that survived the one retry — a
+                # persistent malformed-LLM outage. Count it (else it hides like
+                # the old 'tool loop cap' did).
+                _err_reason = "parse_error"
+            else:
+                _err_reason = None
+            _open_count = len([p for p in state['positions'] if abs(float(p.get('szi') or 0)) > 0])
             cycle_log = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "cycle": invocation_count,
@@ -1025,13 +1255,82 @@ def main():
                 "decisions": cycle_decisions,
                 "account_value": round_or_none(account_value, 2),
                 "balance": round_or_none(state['balance'], 2),
-                "positions_count": len([p for p in state['positions'] if abs(float(p.get('szi') or 0)) > 0]),
+                "positions_count": _open_count,
+                # Phase 0 (0.5/0.3): spend + machine-readable error code per cycle
+                "llm_cost_usd": cycle_cost,
+                "llm_spend_cumulative_usd": round(agent.cumulative_spend_usd, 4),
+                "error": _err_reason,
             }
             try:
                 with open("decisions.jsonl", "a") as f:
                     f.write(json.dumps(cycle_log) + "\n")
-            except Exception:
-                pass
+            except Exception as _dwe:
+                # Phase 0 (0.3): don't swallow silently — a lost decision record
+                # is exactly what made the last outage impossible to diagnose.
+                add_event(f"decisions.jsonl write failed: {_dwe}")
+
+            # Phase 0 (0.4): degenerate-cycle watchdog. An error-hold (api_error /
+            # empty_response / tool_loop_exhausted / parse_error / agent_exception)
+            # is NOT a real decision — count the streak and page the operator.
+            #
+            # CRITICAL nuance (from review): exit(1) is ONLY safe when the account
+            # is FLAT. The loop's LLM-independent risk management (force-close,
+            # SL/exit-rules, trailing) is the sole protection during an LLM outage;
+            # restarting won't fix credit exhaustion and, without a supervisor,
+            # would abandon open positions. So: while positions are open we KEEP
+            # RUNNING and escalate the page; we only exit-for-restart when flat.
+            if _err_reason:
+                error_hold_streak += 1
+                _open_syms = [p.get('coin') for p in state['positions'] if abs(float(p.get('szi') or 0)) > 0]
+                # Page at the threshold, then re-page every `alert_after` cycles
+                # so a long outage keeps surfacing instead of going quiet.
+                if error_hold_streak == alert_after or (
+                    error_hold_streak > alert_after and error_hold_streak % alert_after == 0
+                ):
+                    notify(
+                        f"LLM error-hold streak={error_hold_streak} ({_err_reason}). "
+                        f"Open positions: {_open_syms or 'none'}"
+                        + (" — held under local risk management only." if _open_syms else "."),
+                        level="critical",
+                    )
+                elif error_hold_streak > alert_after:
+                    add_event(f"WATCHDOG: error-hold streak={error_hold_streak} ({_err_reason})")
+                if error_hold_streak >= restart_after:
+                    if _open_syms:
+                        add_event(
+                            f"WATCHDOG: restart suppressed — {len(_open_syms)} position(s) open "
+                            f"({_open_syms}); continuing so local risk management protects them."
+                        )
+                    elif watchdog_restart_when_flat:
+                        notify(
+                            f"LLM error-hold streak={error_hold_streak} >= {restart_after} and "
+                            f"account FLAT — exiting(1) for supervisor restart.",
+                            level="critical",
+                        )
+                        logging.critical(
+                            "WATCHDOG: exit(1) after %d consecutive error-holds (%s), account flat",
+                            error_hold_streak, _err_reason,
+                        )
+                        sys.exit(1)
+            else:
+                error_hold_streak = 0
+
+            # Phase 0 (0.4): per-cycle heartbeat — a single greppable health line.
+            add_event(
+                f"HEARTBEAT cycle={invocation_count} equity=${round_or_none(account_value, 2)} "
+                f"positions={_open_count} err_streak={error_hold_streak} "
+                f"llm_cost=${cycle_cost} llm_cum=${round(agent.cumulative_spend_usd, 3)}"
+            )
+
+            # Phase 2 (2.7): the LLM call took several seconds — re-fetch state so
+            # execution (stacking/flip existence checks, sizing) runs on FRESH
+            # exchange truth, not the snapshot from cycle start (kills the
+            # stale-state race that could turn a flip into a naked position).
+            if outputs.get("trade_decisions") if isinstance(outputs, dict) else False:
+                try:
+                    state = await hyperliquid.get_user_state()
+                except Exception as _rfe:
+                    add_event(f"2.7: pre-execution state refresh failed (using prior): {_rfe}")
 
             # Execute trades for each asset
             for output in outputs.get("trade_decisions", []) if isinstance(outputs, dict) else []:
@@ -1042,6 +1341,7 @@ def main():
                     action = output.get("action")
                     current_price = asset_prices.get(asset, 0)
                     action = output["action"]
+                    _flip_reentry = False  # Phase 2 (2.4): set when this open follows a same-cycle flip close
                     rationale = output.get("rationale", "")
                     if rationale:
                         add_event(f"Decision rationale for {asset}: {rationale}")
@@ -1141,10 +1441,12 @@ def main():
                                 flip_ok = False
                                 try:
                                     close_size = abs(existing_szi)
-                                    if existing_is_long:
-                                        await hyperliquid.place_sell_order(asset, close_size)
-                                    else:
-                                        await hyperliquid.place_buy_order(asset, close_size)
+                                    # Phase 2 (2.1/2.4): reduce-only close (cannot
+                                    # open an opposite naked position), then confirm
+                                    # flat before opening the new side.
+                                    await hyperliquid.market_close(
+                                        asset, is_long=existing_is_long, size=close_size
+                                    )
                                     await hyperliquid.cancel_all_orders(asset)
                                     # Poll to confirm position is closed (up to 5 × 0.5s)
                                     for _ in range(5):
@@ -1181,7 +1483,13 @@ def main():
                                             _flip_pnl = _p.get("pnl")
                                             break
                                     _try_record_close(asset, matched_tr, current_price, _flip_pnl, "flip_close")
-                                    risk_mgr.record_cooldown(asset, "flip")  # P1.2
+                                    # Phase 2 (2.4): do NOT record a cooldown here — it
+                                    # would block this same flip's re-entry below (the
+                                    # self-defeating-flip bug). The new entry records
+                                    # its own cooldown when it opens; mark the re-entry
+                                    # cooldown-exempt so it isn't blocked by any prior
+                                    # cooldown either.
+                                    _flip_reentry = True
                                     with open(diary_path, "a") as f:
                                         f.write(json.dumps({
                                             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1220,9 +1528,17 @@ def main():
                                 pass
                         allowed, reason, output = risk_mgr.validate_trade(
                             output, state, initial_account_value or 0,
-                            regime_context=regime_brief_data.get(asset, {})
+                            regime_context=regime_brief_data.get(asset, {}),
+                            skip_cooldown=_flip_reentry,  # Phase 2 (2.4): flip re-entry isn't self-blocked
                         )
                         if not allowed:
+                            if _flip_reentry:
+                                # A flip closed the old side but the new side was
+                                # rejected — we're now FLAT with an unfulfilled
+                                # reversal intent. Surface it (was silent before).
+                                _fm = f"FLIP {asset}: closed old side but new {new_side} REJECTED ({reason}) — now flat."
+                                add_event(_fm)
+                                notify(_fm, level="warn")
                             add_event(f"RISK BLOCKED {asset}: {reason}")
                             with open(diary_path, "a") as f:
                                 f.write(json.dumps({
@@ -1250,6 +1566,8 @@ def main():
                             CONFIG.get("entry_limit_timeout_sec") or 90
                         )
                         actual_size = amount
+                        actual_entry_px = current_price  # Phase 2 (1.3): overwritten with the REAL fill price
+                        entry_oid = None                 # 1.3: recorded into the trade for fill attribution
                         filled = False
                         order = None
                         order_type = "limit" if entry_order_type_cfg != "market" else "market"
@@ -1355,6 +1673,7 @@ def main():
                                             _sz = abs(float(_pp.get("szi") or 0))
                                             if _sz > 0:
                                                 actual_size = _sz  # partial fill ok
+                                                actual_entry_px = float(_pp.get("entryPx") or 0) or current_price  # 1.3
                                                 filled = True
                                             break
 
@@ -1376,15 +1695,48 @@ def main():
 
                             elapsed_sec = time.monotonic() - poll_start
                             if not filled:
-                                # Order unfilled — cancel any resting portion and skip.
-                                # No market fallback.
+                                # Cancel the resting post-only order first.
                                 try:
                                     await hyperliquid.cancel_order(asset, entry_oid)
                                 except Exception as _ce:
                                     add_event(f"P1.3 cancel error {asset}: {_ce}")
+                            # Phase 2 (2.5): opt-in IOC taker cross to recover a missed
+                            # (often momentum) entry on MAJORS — post-only fills on
+                            # adverse selection (losers fill, winners run away). Capped
+                            # slippage; default OFF so maker-only behavior is unchanged.
+                            if (not filled and CONFIG.get("entry_ioc_fallback")
+                                    and ":" not in asset):
+                                _ioc_slip = float(CONFIG.get("entry_ioc_max_slippage") or 0.003)
+                                add_event(f"2.5 {asset}: limit unfilled — IOC cross (slip<= {_ioc_slip})")
+                                try:
+                                    _px = await hyperliquid.get_current_price(asset) or current_price
+                                    _ioc_px = hyperliquid.round_price(
+                                        asset, _px * (1 + _ioc_slip) if is_buy else _px * (1 - _ioc_slip)
+                                    )
+                                    if is_buy:
+                                        order = await hyperliquid.place_limit_buy(asset, amount, _ioc_px, tif="Ioc")
+                                    else:
+                                        order = await hyperliquid.place_limit_sell(asset, amount, _ioc_px, tif="Ioc")
+                                    order_type = "ioc"
+                                    for _ in range(4):
+                                        await asyncio.sleep(0.4)
+                                        _ps = await hyperliquid.get_user_state()
+                                        for _p in _ps.get("positions", []):
+                                            if normalize_coin(_p.get("coin") or "") == normalize_coin(asset):
+                                                _sz = abs(float(_p.get("szi") or 0))
+                                                if _sz > 0:
+                                                    actual_size = _sz
+                                                    actual_entry_px = float(_p.get("entryPx") or 0) or _px
+                                                    filled = True
+                                                break
+                                        if filled:
+                                            break
+                                except Exception as _ioce:
+                                    add_event(f"2.5 IOC cross failed {asset}: {_ioce}")
+                            if not filled:
                                 add_event(
                                     f"P1.3 SKIP {asset}: limit entry unfilled after "
-                                    f"{elapsed_sec:.0f}s — cancelled, no market fallback"
+                                    f"{elapsed_sec:.0f}s — cancelled"
                                 )
                                 with open(diary_path, "a") as f:
                                     f.write(json.dumps({
@@ -1418,6 +1770,7 @@ def main():
                                             _szi = abs(float(_p.get("szi") or 0))
                                             if _szi > 0:
                                                 actual_size = _szi
+                                                actual_entry_px = float(_p.get("entryPx") or 0) or current_price  # 1.3
                                                 filled = True
                                                 break
                                 except Exception:
@@ -1456,31 +1809,15 @@ def main():
                         _p3_tp1_price = None
                         _p3_tp2_price = None
                         _p3_tp1_frac = float(CONFIG.get("tp1_fraction") or 0.5)
-                        if _p3_partial and output.get("sl_price") and current_price:
-                            try:
-                                _p3_r = abs(current_price - float(output["sl_price"]))
-                                _p3_tp1_at = float(CONFIG.get("tp1_at_r") or 1.0)
-                                _p3_tp2_at = float(CONFIG.get("tp2_at_r") or 2.5)
-                                if _p3_r > 0:
-                                    _p3_tp1_price = (
-                                        current_price + _p3_tp1_at * _p3_r if is_buy
-                                        else current_price - _p3_tp1_at * _p3_r
-                                    )
-                                    _p3_tp2_price = (
-                                        current_price + _p3_tp2_at * _p3_r if is_buy
-                                        else current_price - _p3_tp2_at * _p3_r
-                                    )
-                                    # LLM tp_price is the "minimum far target" override
-                                    _llm_tp = output.get("tp_price")
-                                    if _llm_tp:
-                                        _llm_tp = float(_llm_tp)
-                                        if is_buy and _llm_tp > _p3_tp2_price:
-                                            _p3_tp2_price = _llm_tp
-                                        elif not is_buy and _llm_tp < _p3_tp2_price:
-                                            _p3_tp2_price = _llm_tp
-                            except (TypeError, ValueError):
-                                _p3_tp1_price = None
-                                _p3_tp2_price = None
+                        if _p3_partial and output.get("sl_price") and actual_entry_px:
+                            # Phase 2 (1.3/2.8): R-multiples anchored to the ACTUAL
+                            # fill price via the unit-tested pure helper.
+                            _p3_tp1_price, _p3_tp2_price, _ = compute_bracket_prices(
+                                actual_entry_px, output["sl_price"], is_buy,
+                                CONFIG.get("tp1_at_r") or 1.0,
+                                CONFIG.get("tp2_at_r") or 2.5,
+                                llm_tp=output.get("tp_price"),
+                            )
                         try:
                             if _p3_partial and _p3_tp1_price and _p3_tp2_price:
                                 # Partial TP path: TP1 (fraction) + TP2 (remainder) + SL (full)
@@ -1529,9 +1866,30 @@ def main():
                             orders_ok = False
 
                         if not orders_ok:
-                            # H8: Cancel any partial orders and do NOT register the trade
-                            add_event(f"H8: TP/SL incomplete for {asset} — cancelling all orders, trade not registered")
+                            # Phase 2 (2.2): the entry FILLED but we could not place a
+                            # complete TP/SL bracket. The old code cancelled orders and
+                            # walked away, leaving a NAKED, untracked, leveraged
+                            # position (6 such events in the audit). Instead: cancel
+                            # any partial legs and FLATTEN the position (reduce-only) so
+                            # no unprotected position can ever exist. Alert loudly.
+                            add_event(f"2.2: bracket incomplete for {asset} — cancelling legs and flattening entry")
                             await hyperliquid.cancel_all_orders(asset)
+                            _flattened = False
+                            if filled:
+                                try:
+                                    await hyperliquid.market_close(asset, is_long=is_buy, size=actual_size)
+                                    _flattened = True
+                                except Exception as _fe:
+                                    add_event(f"2.2 flatten error {asset}: {_fe}")
+                                # sweep any resting leg left after the close
+                                try:
+                                    await hyperliquid.cancel_all_orders(asset)
+                                except Exception:
+                                    pass
+                            _m = (f"BRACKET FAIL {asset}: entry filled but TP/SL incomplete — "
+                                  f"{'flattened (reduce-only)' if _flattened else 'FLATTEN FAILED, position may be naked'}.")
+                            add_event(_m)
+                            notify(_m, level="critical")
                             with open(diary_path, "a") as f:
                                 f.write(json.dumps({
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1540,6 +1898,7 @@ def main():
                                     "entry_action": action,
                                     "tp_oid": tp_oid,
                                     "sl_oid": sl_oid,
+                                    "flattened": _flattened,
                                 }) + "\n")
                         else:
                             # All confirmed — register in active_trades and persist
@@ -1562,7 +1921,8 @@ def main():
                                 "asset": asset,
                                 "is_long": is_buy,
                                 "amount": actual_size,
-                                "entry_price": current_price,
+                                "entry_price": actual_entry_px,  # Phase 2 (1.3): REAL fill price
+                                "entry_oid": entry_oid,          # 1.3: for fill attribution
                                 "tp_oid": tp_oid,       # legacy single-TP (None when partial TP)
                                 "tp1_oid": tp1_oid,     # P3.2 partial TP1
                                 "tp2_oid": tp2_oid,     # P3.2 partial TP2
@@ -1573,7 +1933,7 @@ def main():
                                 "tp1_filled": False,            # P3.2
                                 "sl_oid": sl_oid,
                                 "current_sl_price": output.get("sl_price"),  # P3.1 tracking
-                                "peak_price": current_price,                  # P3.1 tracking
+                                "peak_price": actual_entry_px,                # P3.1 tracking
                                 "trailing_active": False,                     # P3.1
                                 "exit_plan": output["exit_plan"],
                                 "exit_rules": exit_rules,
@@ -1686,10 +2046,27 @@ def main():
         """Start the aiohttp server and kick off the trading loop."""
         app = web.Application()
         await start_api(app)
-        runner = web.AppRunner(app)
+        # Phase 0 (0.2): route HTTP access logs to a dedicated file so scanner
+        # noise (18.6% of the last op-log) stops polluting trading telemetry and
+        # ERROR alerts. Combined with the 127.0.0.1 default bind, the signing-key
+        # host is no longer publicly reachable. Guard the file open — a read-only
+        # working dir must not crash the whole bot before the loop even starts.
+        _access_log = None
+        try:
+            _access_logger = logging.getLogger("aiohttp.access")
+            _access_logger.handlers = []
+            _access_handler = logging.FileHandler("api_access.log")
+            _access_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+            _access_logger.addHandler(_access_handler)
+            _access_logger.propagate = False
+            _access_log = _access_logger
+        except OSError as _ale:
+            logging.warning("Could not open api_access.log (%s); disabling HTTP access log.", _ale)
+        runner = web.AppRunner(app, access_log=_access_log)
         await runner.setup()
         site = web.TCPSite(runner, CONFIG.get("api_host"), int(CONFIG.get("api_port")))
         await site.start()
+        logging.info("API server bound to %s:%s", CONFIG.get("api_host"), CONFIG.get("api_port"))
         await run_loop()
 
     def calculate_total_return(state, trade_log):
@@ -1701,8 +2078,14 @@ def main():
     def compute_asset_perf(records, asset, window):
         """Return per-asset win/loss stats from the last `window` closed trades (P3.3).
 
-        Returns None when fewer than 2 records exist for the asset (not enough
-        to compute a meaningful win rate — avoids spurious 0% or 100% displays).
+        Phase 1 (1.6): pnl is now NET OF FEES and reconcile-recovered wins (TP
+        fills) are finally recorded, so these stats reflect reality instead of a
+        loss-only subset. ``sufficient_sample`` (>=6 trades) is surfaced so a tiny
+        2-trade sample can no longer read as an authoritative "0% win rate" — the
+        exact fiction that locked the bot out for 9 days. (The full decaying,
+        size-modulating gate replaces the hard block in Phase 5.)
+
+        Returns None when fewer than 2 records exist for the asset.
         """
         asset_recs = [
             r for r in records
@@ -1720,6 +2103,12 @@ def main():
         outcomes = []
         for r in asset_recs[-5:]:
             outcomes.append("W" if float(r["pnl"]) > 0 else "L")
+        # 1.6: report the ACTUAL fee basis of the sampled rows — only reconcile
+        # (fill-derived) rows are net_of_fees; direct closes still record gross,
+        # so a blanket "net_of_fees" label would be a lie. (Phase 2/3 routes all
+        # closes through fills to make every row genuinely net.)
+        _bases = {r.get("pnl_basis", "gross") for r in asset_recs}
+        _basis = next(iter(_bases)) if len(_bases) == 1 else "mixed"
         return {
             "trades": len(asset_recs),
             "wins": len(wins),
@@ -1729,6 +2118,8 @@ def main():
             "avg_loss": round(avg_loss, 4),
             "net_pnl": round(net_pnl, 4),
             "last_5_outcomes": outcomes,
+            "sufficient_sample": len(asset_recs) >= 6,   # 1.6
+            "pnl_basis": _basis,                          # 1.6 (net_of_fees | gross | mixed)
         }
 
     def calculate_sharpe(records):
