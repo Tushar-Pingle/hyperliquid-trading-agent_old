@@ -7,9 +7,21 @@ import asyncio
 import anthropic
 from src.config_loader import CONFIG
 from src.indicators.local_indicators import compute_all, last_n, latest
+from src.notify import notify
 import json
 import logging
 from datetime import datetime
+
+
+# Phase 0 (0.5): $/MTok (input, output) for spend telemetry. Matched by substring
+# against the model id; cache reads billed ~0.1x input, cache writes ~1.25x input.
+_MODEL_PRICE = {
+    "fable": (10.0, 50.0),
+    "mythos": (10.0, 50.0),
+    "opus": (5.0, 25.0),
+    "sonnet": (3.0, 15.0),
+    "haiku": (1.0, 5.0),
+}
 
 
 class TradingAgent:
@@ -19,8 +31,48 @@ class TradingAgent:
         self.model = CONFIG["llm_model"]
         self.client = anthropic.Anthropic(api_key=CONFIG["anthropic_api_key"])
         self.hyperliquid = hyperliquid
-        self.sanitize_model = CONFIG.get("sanitize_model") or "claude-haiku-4-5-20251001"
+        self.sanitize_model = CONFIG.get("sanitize_model") or "claude-haiku-4-5"
         self.max_tokens = int(CONFIG.get("max_tokens") or 4096)
+        # Phase 0 (0.5): cumulative LLM spend so main.py can log $/cycle and alert.
+        self.cumulative_spend_usd = 0.0
+        self.last_usage = {}
+
+    @staticmethod
+    def _price_for(model: str):
+        """Return ($/MTok input, $/MTok output) for a model id (substring match)."""
+        m = (model or "").lower()
+        for key, price in _MODEL_PRICE.items():
+            if key in m:
+                return price
+        return _MODEL_PRICE["sonnet"]  # sane default if the id is unrecognized
+
+    def _record_usage(self, model, usage):
+        """Accumulate token->USD cost from an API response's usage block.
+
+        Never raises — telemetry must not break a trading decision.
+        """
+        try:
+            in_price, out_price = self._price_for(model)
+            in_tok = int(getattr(usage, "input_tokens", 0) or 0)
+            out_tok = int(getattr(usage, "output_tokens", 0) or 0)
+            cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+            cache_write = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+            cost = (
+                in_tok / 1e6 * in_price
+                + out_tok / 1e6 * out_price
+                + cache_read / 1e6 * in_price * 0.1
+                + cache_write / 1e6 * in_price * 1.25
+            )
+            self.cumulative_spend_usd += cost
+            self.last_usage = {
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "cache_read_input_tokens": cache_read,
+                "cache_creation_input_tokens": cache_write,
+                "cost_usd": round(cost, 6),
+            }
+        except Exception as exc:
+            logging.warning("spend telemetry failed: %s", exc)
 
     def decide_trade(self, assets, context, has_active_trades=False):
         """Decide for multiple assets in one call."""
@@ -218,15 +270,25 @@ class TradingAgent:
             }
             if use_tools and enable_tools:
                 kwargs["tools"] = tools
+            # Phase 0 (0.1): current-model thinking shape. The old
+            # {type:enabled,budget_tokens} 400s on every current model.
             if CONFIG.get("thinking_enabled"):
-                kwargs["thinking"] = {
-                    "type": "enabled",
-                    "budget_tokens": int(CONFIG.get("thinking_budget_tokens") or 10000),
-                }
-                # When thinking is enabled, max_tokens must be larger
-                kwargs["max_tokens"] = max(self.max_tokens, 16000)
+                kwargs["thinking"] = {"type": "adaptive"}
+                _effort = CONFIG.get("thinking_effort")
+                if _effort:
+                    kwargs["output_config"] = {"effort": _effort}
+                # Give adaptive thinking room so the JSON answer isn't truncated.
+                kwargs["max_tokens"] = max(self.max_tokens, 8000)
+            else:
+                # Current Sonnet/Fable run adaptive thinking by DEFAULT when the
+                # field is omitted; disable it explicitly for the cost-controlled
+                # base loop. Fable/Mythos 400 on explicit disable — omit there.
+                _m = (self.model or "").lower()
+                if "fable" not in _m and "mythos" not in _m:
+                    kwargs["thinking"] = {"type": "disabled"}
 
             response = self.client.messages.create(**kwargs)
+            self._record_usage(self.model, response.usage)
             logging.info("Claude response: stop_reason=%s, usage=%s",
                         response.stop_reason, response.usage)
             with open("llm_requests.log", "a", encoding="utf-8") as f:
@@ -320,6 +382,7 @@ class TradingAgent:
                     ),
                     messages=[{"role": "user", "content": raw_content}],
                 )
+                self._record_usage(self.sanitize_model, response.usage)
                 content = ""
                 for block in response.content:
                     if block.type == "text":
@@ -332,14 +395,51 @@ class TradingAgent:
                 logging.error("Sanitize failed: %s", se)
                 return {"reasoning": "", "trade_decisions": []}
 
+        # Phase 0 (0.3): carry a specific, machine-readable failure reason instead
+        # of the old catch-all "tool loop cap" (which laundered a 69h billing
+        # outage into what looked like ordinary hold decisions).
+        failure_reason = "tool_loop_exhausted"
+
+        def _error_holds(reason):
+            """Hold-all fallback that surfaces WHY the cycle failed.
+
+            The top-level ``error`` key lets main.py's watchdog distinguish a real
+            hold from a degenerate error-hold and alert / restart accordingly.
+            """
+            return {
+                "reasoning": reason,
+                "error": reason,
+                "trade_decisions": [{
+                    "asset": a,
+                    "action": "hold",
+                    "allocation_usd": 0.0,
+                    "order_type": "market",
+                    "limit_price": None,
+                    "tp_price": None,
+                    "sl_price": None,
+                    "exit_plan": "",
+                    "exit_rules": [],
+                    "rationale": reason,
+                } for a in assets],
+            }
+
         # Main loop: up to 6 iterations to handle tool calls
         for iteration in range(6):
             try:
                 response = _call_claude(messages)
             except anthropic.APIError as e:
-                logging.error("Claude API error: %s", e)
+                status = getattr(e, "status_code", None)
+                failure_reason = f"api_error:{type(e).__name__}:{status if status is not None else '?'}"
+                logging.error("Claude API error [%s]: %s", failure_reason, e)
                 with open("llm_requests.log", "a", encoding="utf-8") as f:
-                    f.write(f"API Error: {e}\n")
+                    f.write(f"API Error [{failure_reason}]: {e}\n")
+                # 400/401/403 = billing/auth/bad-request — the non-retryable,
+                # credit-exhaustion class behind the historical 69h silent outage.
+                _crit = status in (400, 401, 403) or "authentication" in type(e).__name__.lower()
+                notify(
+                    f"LLM API error ({failure_reason}): {str(e)[:200]}",
+                    level="critical" if _crit else "warn",
+                )
                 break
 
             # Check if the response contains tool use
@@ -385,6 +485,7 @@ class TradingAgent:
 
             if not raw_text.strip():
                 logging.error("Empty response from Claude")
+                failure_reason = "empty_response"
                 break
 
             # Strip markdown code fences if present
@@ -446,16 +547,6 @@ class TradingAgent:
                     } for a in assets]
                 }
 
-        # Exhausted tool loop
-        return {
-            "reasoning": "tool loop cap",
-            "trade_decisions": [{
-                "asset": a,
-                "action": "hold",
-                "allocation_usd": 0.0,
-                "tp_price": None,
-                "sl_price": None,
-                "exit_plan": "",
-                "rationale": "tool loop cap"
-            } for a in assets]
-        }
+        # Reached only via an error break (api_error / empty_response) or by
+        # exhausting the tool loop — carry the specific reason, never a mislabel.
+        return _error_holds(failure_reason)

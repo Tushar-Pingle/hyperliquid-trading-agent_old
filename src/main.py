@@ -22,6 +22,7 @@ from aiohttp import web
 from src.utils.formatting import format_number as fmt, format_size as fmt_sz
 from src.utils.prompt_utils import json_default, round_or_none, round_series
 from src.regime_analyzer import refresh_regime
+from src.notify import notify
 
 load_dotenv()
 
@@ -58,6 +59,21 @@ def get_interval_seconds(interval_str):
         return int(interval_str[:-1]) * 86400
     else:
         raise ValueError(f"Unsupported interval: {interval_str}")
+
+
+def _git_sha() -> str:
+    """Best-effort short git SHA for the startup fingerprint (Phase 0 0.7)."""
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(pathlib.Path(__file__).parent.parent),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
 
 def main():
     """Parse CLI args, bootstrap dependencies, and launch the trading loop."""
@@ -102,6 +118,31 @@ def main():
             args.interval, interval_sec,
         )
 
+    # Phase 0 (0.7) — immutable startup fingerprint. The last run had 23
+    # undocumented restarts whose config had to be reverse-engineered from log
+    # gaps; log it once, plainly, on every boot.
+    _fingerprint = {
+        "git_sha": _git_sha(),
+        "model": CONFIG.get("llm_model"),
+        "sanitize_model": CONFIG.get("sanitize_model"),
+        "network": CONFIG.get("hyperliquid_network"),
+        "assets": args.assets,
+        "interval": args.interval,
+        "api_host": CONFIG.get("api_host"),
+        "thinking_enabled": CONFIG.get("thinking_enabled"),
+        "enable_tool_calling": CONFIG.get("enable_tool_calling"),
+        "regime_gate_volatile": CONFIG.get("regime_gate_volatile"),
+        "partial_tp_enabled": CONFIG.get("partial_tp_enabled"),
+        "trailing_stop_enabled": CONFIG.get("trailing_stop_enabled"),
+        "perf_memory_enabled": CONFIG.get("perf_memory_enabled"),
+        "alerts_configured": bool(CONFIG.get("alert_webhook_url")),
+    }
+    logging.info("STARTUP FINGERPRINT: %s", json.dumps(_fingerprint))
+    if not CONFIG.get("alert_webhook_url"):
+        logging.warning(
+            "Phase 0 (0.6): ALERT_WEBHOOK_URL is not set — operator alerts will "
+            "only be logged, not pushed. Set it before running live."
+        )
 
     start_time = datetime.now(timezone.utc)
     invocation_count = 0
@@ -281,6 +322,33 @@ def main():
         except Exception as _seed_err:
             add_event(f"P1.2: cooldown seed error (non-fatal): {_seed_err}")
 
+        # Phase 0 (0.7) — startup equity/position fingerprint + alert
+        try:
+            _boot_state = await hyperliquid.get_user_state()
+            _boot_pos = [
+                p.get('coin') for p in _boot_state.get('positions', [])
+                if abs(float(p.get('szi') or 0)) > 0
+            ]
+            _boot_eq = _boot_state.get('total_value')
+            add_event(f"BOOT: equity=${round_or_none(_boot_eq, 2)} open_positions={_boot_pos or 'none'}")
+            notify(
+                f"Bot started · equity=${round_or_none(_boot_eq, 2)} · "
+                f"positions={_boot_pos or 'none'} · model={CONFIG.get('llm_model')}",
+                level="info",
+            )
+        except Exception as _be:
+            add_event(f"BOOT: equity fingerprint failed: {_be}")
+
+        # Phase 0 watchdog / spend / equity-sanity state (loop-scoped)
+        error_hold_streak = 0                       # 0.4: consecutive LLM error-holds
+        alert_after = int(CONFIG.get("error_hold_alert_after") or 3)
+        restart_after = int(CONFIG.get("error_hold_restart_after") or 8)
+        last_known_equity = None                    # 0.8: equity-glitch guard
+        equity_dev_pct = float(CONFIG.get("equity_sanity_deviation_pct") or 50)
+        daily_spend = {}                            # 0.5: {UTC-date: usd}
+        daily_spend_alerted = set()
+        daily_spend_limit = float(CONFIG.get("llm_daily_spend_alert_usd") or 1.0)
+
         while True:
             invocation_count += 1
             minutes_since_start = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
@@ -310,6 +378,24 @@ def main():
             sharpe = calculate_sharpe(trade_log)
 
             account_value = total_value
+
+            # Phase 0 (0.8): refuse to act on a suspect equity read (the $0.01
+            # flap sized/reasoned on garbage last run). Skip this cycle if equity
+            # jumped >N% vs last-known with no matching transfer; adopt the new
+            # value so a genuine deposit/withdrawal resumes trading next cycle.
+            if last_known_equity is not None and last_known_equity > 1.0:
+                _dev = abs(account_value - last_known_equity) / last_known_equity * 100.0
+                if _dev > equity_dev_pct:
+                    _m = (f"Equity sanity: read ${round_or_none(account_value, 2)} deviates "
+                          f"{round(_dev, 1)}% from last-known ${round_or_none(last_known_equity, 2)} "
+                          f"— skipping cycle (suspect read/transfer).")
+                    add_event(_m)
+                    notify(_m, level="warn")
+                    last_known_equity = account_value
+                    await asyncio.sleep(get_interval_seconds(args.interval))
+                    continue
+            last_known_equity = account_value
+
             if initial_account_value is None:
                 initial_account_value = account_value
             total_return_pct = ((account_value - initial_account_value) / initial_account_value * 100.0) if initial_account_value else 0.0
@@ -975,6 +1061,7 @@ def main():
                 except Exception:
                     return True
 
+            _spend_before = agent.cumulative_spend_usd  # Phase 0 (0.5)
             try:
                 outputs = agent.decide_trade(args.assets, context, has_active_trades=bool(active_trades))
                 if not isinstance(outputs, dict):
@@ -1005,6 +1092,18 @@ def main():
                     add_event(f"Retry traceback: {traceback.format_exc()}")
                     outputs = {}
 
+            # Phase 0 (0.5): cost of this cycle's LLM calls (primary + retry + sanitize)
+            cycle_cost = round(agent.cumulative_spend_usd - _spend_before, 6)
+            _day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            daily_spend[_day] = daily_spend.get(_day, 0.0) + cycle_cost
+            if daily_spend[_day] > daily_spend_limit and _day not in daily_spend_alerted:
+                daily_spend_alerted.add(_day)
+                notify(
+                    f"LLM daily spend ${round(daily_spend[_day], 3)} exceeded "
+                    f"${daily_spend_limit} on {_day} UTC.",
+                    level="warn",
+                )
+
             reasoning_text = outputs.get("reasoning", "") if isinstance(outputs, dict) else ""
             if reasoning_text:
                 add_event(f"LLM reasoning summary: {reasoning_text}")
@@ -1018,6 +1117,16 @@ def main():
                     "allocation_usd": d.get("allocation_usd", 0),
                     "rationale": d.get("rationale", ""),
                 })
+            # Phase 0 (0.4): a cycle is a degenerate "error-hold" if the agent
+            # tagged it (api_error/empty/tool_loop) OR it produced no decisions at
+            # all (an unhandled exception left outputs={} — also a hard failure).
+            if isinstance(outputs, dict) and outputs.get("error"):
+                _err_reason = outputs.get("error")
+            elif not isinstance(outputs, dict) or not outputs.get("trade_decisions"):
+                _err_reason = "agent_exception"
+            else:
+                _err_reason = None
+            _open_count = len([p for p in state['positions'] if abs(float(p.get('szi') or 0)) > 0])
             cycle_log = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "cycle": invocation_count,
@@ -1025,13 +1134,56 @@ def main():
                 "decisions": cycle_decisions,
                 "account_value": round_or_none(account_value, 2),
                 "balance": round_or_none(state['balance'], 2),
-                "positions_count": len([p for p in state['positions'] if abs(float(p.get('szi') or 0)) > 0]),
+                "positions_count": _open_count,
+                # Phase 0 (0.5/0.3): spend + machine-readable error code per cycle
+                "llm_cost_usd": cycle_cost,
+                "llm_spend_cumulative_usd": round(agent.cumulative_spend_usd, 4),
+                "error": _err_reason,
             }
             try:
                 with open("decisions.jsonl", "a") as f:
                     f.write(json.dumps(cycle_log) + "\n")
-            except Exception:
-                pass
+            except Exception as _dwe:
+                # Phase 0 (0.3): don't swallow silently — a lost decision record
+                # is exactly what made the last outage impossible to diagnose.
+                add_event(f"decisions.jsonl write failed: {_dwe}")
+
+            # Phase 0 (0.4): degenerate-cycle watchdog. An error-hold (api_error /
+            # empty_response / tool_loop_exhausted) is NOT a real decision — count
+            # the streak, alert, and force a supervisor restart before another 69h
+            # silent outage can happen.
+            if _err_reason:
+                error_hold_streak += 1
+                _open_syms = [p.get('coin') for p in state['positions'] if abs(float(p.get('szi') or 0)) > 0]
+                if error_hold_streak == alert_after:
+                    notify(
+                        f"LLM error-hold streak={error_hold_streak} ({_err_reason}). "
+                        f"Open positions: {_open_syms or 'none'}"
+                        + (" — UNMANAGED while LLM is down." if _open_syms else "."),
+                        level="critical",
+                    )
+                elif error_hold_streak > alert_after:
+                    add_event(f"WATCHDOG: error-hold streak={error_hold_streak} ({_err_reason})")
+                if error_hold_streak >= restart_after:
+                    notify(
+                        f"LLM error-hold streak={error_hold_streak} >= {restart_after}; "
+                        f"exiting non-zero for supervisor restart.",
+                        level="critical",
+                    )
+                    logging.critical(
+                        "WATCHDOG: exit(1) after %d consecutive error-holds (%s)",
+                        error_hold_streak, _err_reason,
+                    )
+                    sys.exit(1)
+            else:
+                error_hold_streak = 0
+
+            # Phase 0 (0.4): per-cycle heartbeat — a single greppable health line.
+            add_event(
+                f"HEARTBEAT cycle={invocation_count} equity=${round_or_none(account_value, 2)} "
+                f"positions={_open_count} err_streak={error_hold_streak} "
+                f"llm_cost=${cycle_cost} llm_cum=${round(agent.cumulative_spend_usd, 3)}"
+            )
 
             # Execute trades for each asset
             for output in outputs.get("trade_decisions", []) if isinstance(outputs, dict) else []:
@@ -1686,10 +1838,21 @@ def main():
         """Start the aiohttp server and kick off the trading loop."""
         app = web.Application()
         await start_api(app)
-        runner = web.AppRunner(app)
+        # Phase 0 (0.2): route HTTP access logs to a dedicated file so scanner
+        # noise (18.6% of the last op-log) stops polluting trading telemetry and
+        # ERROR alerts. Combined with the 127.0.0.1 default bind, the signing-key
+        # host is no longer publicly reachable.
+        _access_logger = logging.getLogger("aiohttp.access")
+        _access_logger.handlers = []
+        _access_handler = logging.FileHandler("api_access.log")
+        _access_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        _access_logger.addHandler(_access_handler)
+        _access_logger.propagate = False
+        runner = web.AppRunner(app, access_log=_access_logger)
         await runner.setup()
         site = web.TCPSite(runner, CONFIG.get("api_host"), int(CONFIG.get("api_port")))
         await site.start()
+        logging.info("API server bound to %s:%s", CONFIG.get("api_host"), CONFIG.get("api_port"))
         await run_loop()
 
     def calculate_total_return(state, trade_log):

@@ -458,7 +458,10 @@ class HyperliquidAPI:
         """
         state = await self._retry(lambda: self.info.user_state(self.query_address))
         positions = list(state.get("assetPositions", []))
-        total_value = float(state.get("accountValue", 0.0))
+        # Phase 0 (0.8): accountValue lives under marginSummary, not at the top
+        # level — the old top-level read always returned 0.0, so equity math fell
+        # through to the (buggy) fallback below on every standard perp account.
+        total_value = float(state.get("marginSummary", {}).get("accountValue", 0.0) or 0.0)
 
         # HIP-3: info.user_state only returns MAIN perp dex positions. Positions
         # held on HIP-3 builder-deployed perp dexes (e.g. "xyz") require an
@@ -534,7 +537,9 @@ class HyperliquidAPI:
             logging.warning("Failed to fetch spot state for unified account: %s", e)
 
         if not total_value:
-            total_value = balance + sum(max(p.get("pnl", 0.0), 0.0) for p in enriched_positions)
+            # Phase 0 (0.8): include NEGATIVE pnl — the old max(pnl,0) overstated
+            # equity while losing, corrupting sizing and leverage math.
+            total_value = balance + sum(p.get("pnl", 0.0) for p in enriched_positions)
         return {
             "balance": balance,
             "total_value": total_value,

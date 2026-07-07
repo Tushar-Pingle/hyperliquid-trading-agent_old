@@ -77,15 +77,20 @@ CONFIG = {
     "hyperliquid_vault_address": _get_env("HYPERLIQUID_VAULT_ADDRESS"),  # Main wallet address (agent signs on behalf)
 
     # LLM — Anthropic Claude API (primary)
+    # Phase 0 (0.1): claude-sonnet-4-20250514 RETIRED 2026-06-15 — every call fails.
+    # Default migrated to claude-sonnet-5. Update the SDK (pyproject/Dockerfile).
     "anthropic_api_key": _get_env("ANTHROPIC_API_KEY", required=True),
-    "llm_model": _get_env("LLM_MODEL", "claude-sonnet-4-20250514"),
-    "sanitize_model": _get_env("SANITIZE_MODEL", "claude-haiku-4-5-20251001"),
+    "llm_model": _get_env("LLM_MODEL", "claude-sonnet-5"),
+    "sanitize_model": _get_env("SANITIZE_MODEL", "claude-haiku-4-5"),
     "max_tokens": _get_int("MAX_TOKENS", 4096),
     "enable_tool_calling": _get_bool("ENABLE_TOOL_CALLING", False),
 
-    # Extended thinking (Claude)
+    # Extended thinking (Claude). Phase 0 (0.1): the old {type:enabled,budget_tokens}
+    # shape 400s on all current models. thinking_enabled=false -> {type:disabled}
+    # (default; matches the historical run and controls cost). thinking_enabled=true
+    # -> {type:adaptive} with thinking_effort ("low"|"medium"|"high"|"xhigh"|"max").
     "thinking_enabled": _get_bool("THINKING_ENABLED", False),
-    "thinking_budget_tokens": _get_int("THINKING_BUDGET_TOKENS", 10000),
+    "thinking_effort": _get_env("THINKING_EFFORT"),  # None -> SDK/model default
 
     # Runtime controls
     "assets": _get_env("ASSETS"),  # e.g., "BTC ETH SOL OIL GOLD SPX"
@@ -101,9 +106,20 @@ CONFIG = {
     "max_concurrent_positions": _get_env("MAX_CONCURRENT_POSITIONS", "10"),
     "min_balance_reserve_pct": _get_env("MIN_BALANCE_RESERVE_PCT", "10"),
 
-    # API server
-    "api_host": _get_env("API_HOST", "0.0.0.0"),
+    # API server. Phase 0 (0.2): default bound to loopback — the box holds the
+    # exchange signing key and was being probed by credential scanners on 0.0.0.0.
+    # For remote dashboard access use an SSH tunnel, not a public bind.
+    "api_host": _get_env("API_HOST", "127.0.0.1"),
     "api_port": _get_env("APP_PORT") or _get_env("API_PORT") or "3000",
+
+    # Phase 0 (0.6/0.4/0.5) — operations, alerting, watchdog, spend telemetry
+    "alert_webhook_url": _get_env("ALERT_WEBHOOK_URL"),
+    "error_hold_alert_after": _get_int("ERROR_HOLD_ALERT_AFTER", 3),
+    "error_hold_restart_after": _get_int("ERROR_HOLD_RESTART_AFTER", 8),
+    "llm_daily_spend_alert_usd": _get_env("LLM_DAILY_SPEND_ALERT_USD", "1.00"),
+    # Phase 0 (0.8) — skip trading a cycle when equity jumps this % vs last-known
+    # without a matching fill/transfer (guards the $0.01 equity-read glitch).
+    "equity_sanity_deviation_pct": _get_env("EQUITY_SANITY_DEVIATION_PCT", "50"),
 
     # P1.2 — per-asset cooldown
     "cooldown_bars": _get_env("COOLDOWN_BARS", "3"),           # bars of silence after any open/close/flip

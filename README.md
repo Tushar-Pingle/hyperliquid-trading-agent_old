@@ -45,6 +45,21 @@ All enforced in code, not just LLM prompts. Configurable via `.env`:
 | Sharpe sample gate | `MIN_SHARPE_SAMPLE` | 10 | Don't compute Sharpe until this many closed trades exist (P2.5) |
 | Sharpe window | `SHARPE_WINDOW` | 50 | Most-recent closed trades used in Sharpe (P2.5) |
 
+## Phase 0 — Day-0 blockers (operational safety)
+
+Make the bot runnable, safe, and observable. See `IMPROVEMENT_PLAN.md` for the full rationale.
+
+| Item | Env var / change | Default | Description |
+|------|------------------|---------|-------------|
+| **0.1 Model migration** | `LLM_MODEL` | `claude-sonnet-5` | `claude-sonnet-4-20250514` **retired 2026-06-15**. Thinking now uses the current shape: off by default (`{type:disabled}`); `THINKING_ENABLED=true` → adaptive, with optional `THINKING_EFFORT` (`low`..`max`). |
+| **0.2 Loopback API** | `API_HOST` | `127.0.0.1` | Status server no longer binds `0.0.0.0` (the signing-key host was being scanned). Use an SSH tunnel for remote access. HTTP access logs go to `api_access.log`. |
+| **0.3 Error honesty** | — | — | LLM failures are logged with specific reason codes (`api_error:<class>:<status>`, `empty_response`, `tool_loop_exhausted`) and a machine-readable `error` field in `decisions.jsonl` — no more `"tool loop cap"` mislabel that hid a 69h outage. |
+| **0.4 Watchdog** | `ERROR_HOLD_ALERT_AFTER` / `ERROR_HOLD_RESTART_AFTER` | `3` / `8` | Alerts after N consecutive error-holds; `exit(1)` (for supervisor restart) after M. A `HEARTBEAT` line is logged every cycle. |
+| **0.5 Spend telemetry** | `LLM_DAILY_SPEND_ALERT_USD` | `1.00` | Per-cycle LLM cost (`llm_cost_usd`, cumulative) logged to `decisions.jsonl`; alert when a UTC day's spend exceeds the limit. |
+| **0.6 Push alerts** | `ALERT_WEBHOOK_URL` | _(unset)_ | Non-blocking operator alerts (ntfy.sh or generic webhook). Unset → alerts are logged only. |
+| **0.7 Startup fingerprint** | — | — | Logs git SHA, model, interval, assets, gate flags, network, and boot equity/positions on every start. |
+| **0.8 Balance sanity** | `EQUITY_SANITY_DEVIATION_PCT` | `50` | Reads `marginSummary.accountValue` (was always 0), includes negative PnL in the equity fallback, and skips a cycle when equity jumps >N% vs last-known without a matching transfer. |
+
 ## Setup
 
 ### Prerequisites
