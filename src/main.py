@@ -343,8 +343,11 @@ def main():
         error_hold_streak = 0                       # 0.4: consecutive LLM error-holds
         alert_after = int(CONFIG.get("error_hold_alert_after") or 3)
         restart_after = int(CONFIG.get("error_hold_restart_after") or 8)
-        last_known_equity = None                    # 0.8: equity-glitch guard
+        last_known_equity = None                    # 0.8: last GOOD equity
+        suspect_equity_streak = 0                   # 0.8: consecutive suspect reads
         equity_dev_pct = float(CONFIG.get("equity_sanity_deviation_pct") or 50)
+        equity_suspect_adopt_after = int(CONFIG.get("equity_suspect_adopt_after") or 4)
+        watchdog_restart_when_flat = bool(CONFIG.get("watchdog_restart_when_flat", True))
         daily_spend = {}                            # 0.5: {UTC-date: usd}
         daily_spend_alerted = set()
         daily_spend_limit = float(CONFIG.get("llm_daily_spend_alert_usd") or 1.0)
@@ -379,23 +382,10 @@ def main():
 
             account_value = total_value
 
-            # Phase 0 (0.8): refuse to act on a suspect equity read (the $0.01
-            # flap sized/reasoned on garbage last run). Skip this cycle if equity
-            # jumped >N% vs last-known with no matching transfer; adopt the new
-            # value so a genuine deposit/withdrawal resumes trading next cycle.
-            if last_known_equity is not None and last_known_equity > 1.0:
-                _dev = abs(account_value - last_known_equity) / last_known_equity * 100.0
-                if _dev > equity_dev_pct:
-                    _m = (f"Equity sanity: read ${round_or_none(account_value, 2)} deviates "
-                          f"{round(_dev, 1)}% from last-known ${round_or_none(last_known_equity, 2)} "
-                          f"— skipping cycle (suspect read/transfer).")
-                    add_event(_m)
-                    notify(_m, level="warn")
-                    last_known_equity = account_value
-                    await asyncio.sleep(get_interval_seconds(args.interval))
-                    continue
-            last_known_equity = account_value
-
+            # Phase 0 (0.8): the equity-sanity guard is applied LOWER DOWN, just
+            # before the LLM/new-entry section — so a suspect read gates only NEW
+            # entries, while LLM-independent protective management (force-close,
+            # SL/exit-rules, trailing) below still runs this cycle.
             if initial_account_value is None:
                 initial_account_value = account_value
             total_return_pct = ((account_value - initial_account_value) / initial_account_value * 100.0) if initial_account_value else 0.0
@@ -1024,6 +1014,38 @@ def main():
                 except Exception:
                     continue
 
+            # Phase 0 (0.8): equity-sanity guard — gates NEW ENTRIES only (all
+            # protective management above has already run this cycle). Do NOT
+            # adopt the suspect value into last_known_equity (a persistent glitch
+            # would otherwise become the baseline and we'd size on garbage); keep
+            # the last GOOD value and only adopt after the read has persisted for
+            # N cycles (then it is almost certainly a real deposit/withdrawal).
+            if last_known_equity is not None and last_known_equity > 1.0:
+                _dev = abs(account_value - last_known_equity) / last_known_equity * 100.0
+                if _dev > equity_dev_pct:
+                    suspect_equity_streak += 1
+                    if suspect_equity_streak >= equity_suspect_adopt_after:
+                        _m = (f"Equity sanity: ${round_or_none(account_value, 2)} persisted "
+                              f"{suspect_equity_streak} cycles ({round(_dev, 1)}% vs "
+                              f"${round_or_none(last_known_equity, 2)}) — adopting as real; resuming.")
+                        add_event(_m)
+                        notify(_m, level="warn")
+                        last_known_equity = account_value
+                        suspect_equity_streak = 0
+                    else:
+                        _m = (f"Equity sanity: read ${round_or_none(account_value, 2)} deviates "
+                              f"{round(_dev, 1)}% from last-known ${round_or_none(last_known_equity, 2)} "
+                              f"— skipping NEW ENTRIES (suspect read; protective mgmt already ran).")
+                        add_event(_m)
+                        notify(_m, level="warn")
+                        await asyncio.sleep(get_interval_seconds(args.interval))
+                        continue
+                else:
+                    suspect_equity_streak = 0
+                    last_known_equity = account_value
+            else:
+                last_known_equity = account_value
+
             # Single LLM call with all assets
             context_payload = OrderedDict([
                 ("invocation", {
@@ -1124,6 +1146,11 @@ def main():
                 _err_reason = outputs.get("error")
             elif not isinstance(outputs, dict) or not outputs.get("trade_decisions"):
                 _err_reason = "agent_exception"
+            elif _is_failed_outputs(outputs):
+                # All-holds-with-'parse error' that survived the one retry — a
+                # persistent malformed-LLM outage. Count it (else it hides like
+                # the old 'tool loop cap' did).
+                _err_reason = "parse_error"
             else:
                 _err_reason = None
             _open_count = len([p for p in state['positions'] if abs(float(p.get('szi') or 0)) > 0])
@@ -1149,32 +1176,48 @@ def main():
                 add_event(f"decisions.jsonl write failed: {_dwe}")
 
             # Phase 0 (0.4): degenerate-cycle watchdog. An error-hold (api_error /
-            # empty_response / tool_loop_exhausted) is NOT a real decision — count
-            # the streak, alert, and force a supervisor restart before another 69h
-            # silent outage can happen.
+            # empty_response / tool_loop_exhausted / parse_error / agent_exception)
+            # is NOT a real decision — count the streak and page the operator.
+            #
+            # CRITICAL nuance (from review): exit(1) is ONLY safe when the account
+            # is FLAT. The loop's LLM-independent risk management (force-close,
+            # SL/exit-rules, trailing) is the sole protection during an LLM outage;
+            # restarting won't fix credit exhaustion and, without a supervisor,
+            # would abandon open positions. So: while positions are open we KEEP
+            # RUNNING and escalate the page; we only exit-for-restart when flat.
             if _err_reason:
                 error_hold_streak += 1
                 _open_syms = [p.get('coin') for p in state['positions'] if abs(float(p.get('szi') or 0)) > 0]
-                if error_hold_streak == alert_after:
+                # Page at the threshold, then re-page every `alert_after` cycles
+                # so a long outage keeps surfacing instead of going quiet.
+                if error_hold_streak == alert_after or (
+                    error_hold_streak > alert_after and error_hold_streak % alert_after == 0
+                ):
                     notify(
                         f"LLM error-hold streak={error_hold_streak} ({_err_reason}). "
                         f"Open positions: {_open_syms or 'none'}"
-                        + (" — UNMANAGED while LLM is down." if _open_syms else "."),
+                        + (" — held under local risk management only." if _open_syms else "."),
                         level="critical",
                     )
                 elif error_hold_streak > alert_after:
                     add_event(f"WATCHDOG: error-hold streak={error_hold_streak} ({_err_reason})")
                 if error_hold_streak >= restart_after:
-                    notify(
-                        f"LLM error-hold streak={error_hold_streak} >= {restart_after}; "
-                        f"exiting non-zero for supervisor restart.",
-                        level="critical",
-                    )
-                    logging.critical(
-                        "WATCHDOG: exit(1) after %d consecutive error-holds (%s)",
-                        error_hold_streak, _err_reason,
-                    )
-                    sys.exit(1)
+                    if _open_syms:
+                        add_event(
+                            f"WATCHDOG: restart suppressed — {len(_open_syms)} position(s) open "
+                            f"({_open_syms}); continuing so local risk management protects them."
+                        )
+                    elif watchdog_restart_when_flat:
+                        notify(
+                            f"LLM error-hold streak={error_hold_streak} >= {restart_after} and "
+                            f"account FLAT — exiting(1) for supervisor restart.",
+                            level="critical",
+                        )
+                        logging.critical(
+                            "WATCHDOG: exit(1) after %d consecutive error-holds (%s), account flat",
+                            error_hold_streak, _err_reason,
+                        )
+                        sys.exit(1)
             else:
                 error_hold_streak = 0
 
@@ -1841,14 +1884,20 @@ def main():
         # Phase 0 (0.2): route HTTP access logs to a dedicated file so scanner
         # noise (18.6% of the last op-log) stops polluting trading telemetry and
         # ERROR alerts. Combined with the 127.0.0.1 default bind, the signing-key
-        # host is no longer publicly reachable.
-        _access_logger = logging.getLogger("aiohttp.access")
-        _access_logger.handlers = []
-        _access_handler = logging.FileHandler("api_access.log")
-        _access_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-        _access_logger.addHandler(_access_handler)
-        _access_logger.propagate = False
-        runner = web.AppRunner(app, access_log=_access_logger)
+        # host is no longer publicly reachable. Guard the file open — a read-only
+        # working dir must not crash the whole bot before the loop even starts.
+        _access_log = None
+        try:
+            _access_logger = logging.getLogger("aiohttp.access")
+            _access_logger.handlers = []
+            _access_handler = logging.FileHandler("api_access.log")
+            _access_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+            _access_logger.addHandler(_access_handler)
+            _access_logger.propagate = False
+            _access_log = _access_logger
+        except OSError as _ale:
+            logging.warning("Could not open api_access.log (%s); disabling HTTP access log.", _ale)
+        runner = web.AppRunner(app, access_log=_access_log)
         await runner.setup()
         site = web.TCPSite(runner, CONFIG.get("api_host"), int(CONFIG.get("api_port")))
         await site.start()

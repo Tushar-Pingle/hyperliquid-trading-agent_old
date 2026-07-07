@@ -117,9 +117,15 @@ CONFIG = {
     "error_hold_alert_after": _get_int("ERROR_HOLD_ALERT_AFTER", 3),
     "error_hold_restart_after": _get_int("ERROR_HOLD_RESTART_AFTER", 8),
     "llm_daily_spend_alert_usd": _get_env("LLM_DAILY_SPEND_ALERT_USD", "1.00"),
-    # Phase 0 (0.8) — skip trading a cycle when equity jumps this % vs last-known
-    # without a matching fill/transfer (guards the $0.01 equity-read glitch).
+    # Phase 0 (0.8) — skip NEW ENTRIES for a cycle when equity jumps this % vs
+    # last-known without a matching fill/transfer (guards the $0.01 read glitch).
+    # Protective management (force-close/SL/exit-rules) still runs. After the
+    # read persists EQUITY_SUSPECT_ADOPT_AFTER cycles it is adopted as real.
     "equity_sanity_deviation_pct": _get_env("EQUITY_SANITY_DEVIATION_PCT", "50"),
+    "equity_suspect_adopt_after": _get_int("EQUITY_SUSPECT_ADOPT_AFTER", 4),
+    # Phase 0 (0.4) — only exit(1) for a supervisor restart when FLAT; never
+    # abandon open positions to a possibly-supervisorless environment.
+    "watchdog_restart_when_flat": _get_bool("WATCHDOG_RESTART_WHEN_FLAT", True),
 
     # P1.2 — per-asset cooldown
     "cooldown_bars": _get_env("COOLDOWN_BARS", "3"),           # bars of silence after any open/close/flip
