@@ -25,7 +25,7 @@ from src.regime_analyzer import refresh_regime
 from src.notify import notify
 from src.fills import (
     newest_fills, fill_is_buy, fill_coin_matches, fill_time_ms,
-    realized_from_fills, classify_fill,
+    realized_from_fills, classify_fill, attribute_position_fills,
 )
 
 load_dotenv()
@@ -196,7 +196,7 @@ def main():
 
     def _try_record_close(asset, active_tr, exit_price, pnl, close_reason,
                            margin=None, leverage=None, leverage_fallback=False,
-                           fees_paid=None, gross_pnl=None):
+                           fees_paid=None, gross_pnl=None, pnl_basis="gross"):
         """Best-effort helper to record a close. Pulls entry / size / opened_at
         from the matching active_trade record when present so the close site
         only has to supply what it directly knows.
@@ -235,6 +235,7 @@ def main():
                 "exit_price": exit_price,
                 "size": size,
                 "pnl": pnl,                       # net of fees when fill-derived (1.4)
+                "pnl_basis": pnl_basis,           # 'net_of_fees' (reconcile) | 'gross' | 'unavailable'
                 "gross_pnl": gross_pnl,           # exchange closedPnl before fees
                 "fees_paid": fees_paid,           # entry + exit fees (1.4)
                 "margin": margin,
@@ -535,7 +536,7 @@ def main():
                     open_orders_struct.append({
                         "coin": o.get('coin'),
                         "oid": o.get('oid'),
-                        "is_buy": o.get('isBuy'),
+                        "is_buy": fill_is_buy(o),  # orders carry side/dir, not isBuy
                         "size": round_or_none(o.get('sz'), 6),
                         "price": round_or_none(o.get('px'), 2),
                         "trigger_price": round_or_none(o.get('triggerPx'), 2),
@@ -590,10 +591,10 @@ def main():
                         if tr['_orphan_cycles'] >= ORPHAN_CYCLES_REQUIRED:
                             add_event(f"Reconciling stale active trade for {asset} (orphan for {tr['_orphan_cycles']} cycles)")
                             # Phase 1 (1.2/1.4): recover REAL exit price + net PnL +
-                            # fees from exchange fills. Fetch the position's own
-                            # window (opened_at minus a 60s buffer to capture the
-                            # entry fill's fee) rather than a fixed-size page that
-                            # used to return the wrong (oldest) fills.
+                            # fees from the position's OWN fills. Attribution is by
+                            # the trade's exit-order oids (globally unique), so a
+                            # prior/adjacent same-asset trade can't leak in; a
+                            # closing fill is REQUIRED before recording a close.
                             rec_exit_price = None
                             rec_pnl = None
                             rec_gross = None
@@ -607,43 +608,43 @@ def main():
                                     ).timestamp() * 1000)
                                 except Exception:
                                     opened_ts_ms = 0
-                            try:
-                                _window_start = max(0, opened_ts_ms - 60_000) if opened_ts_ms else 0
-                                if _window_start:
-                                    _wfills = await hyperliquid.get_fills_since(_window_start)
-                                else:
-                                    _wfills = await hyperliquid.get_recent_fills(limit=200)
-                                trade_fills = [
-                                    _f for _f in _wfills
-                                    if fill_coin_matches(_f, asset)
-                                    and fill_time_ms(_f) >= (_window_start or 0)
-                                ]
-                                if trade_fills:
-                                    _agg = realized_from_fills(trade_fills)
-                                    rec_exit_price = _agg["exit_px"]
-                                    rec_pnl = _agg["net_pnl"]
-                                    rec_gross = _agg["gross_pnl"]
-                                    rec_fees = _agg["fees"]
-                                    add_event(
-                                        f"Reconcile {asset}: net_pnl=${round_or_none(rec_pnl, 4)} "
-                                        f"(gross=${round_or_none(rec_gross, 4)}, fees=${round_or_none(rec_fees, 4)}) "
-                                        f"from {_agg['n_fills']} fill(s), exit=${round_or_none(rec_exit_price, 4)}"
-                                    )
-                                else:
-                                    rec_exit_unavailable = True
-                            except Exception as _e:
+                            if not opened_ts_ms:
+                                # No parseable open time → we cannot bound the fill
+                                # window safely; don't aggregate an unbounded history.
                                 rec_exit_unavailable = True
-                                logging.warning("Phase1: fill lookup failed for %s reconcile: %s", asset, _e)
+                            else:
+                                try:
+                                    _wfills = await hyperliquid.get_fills_since(max(0, opened_ts_ms - 120_000))
+                                    trade_fills = attribute_position_fills(_wfills, tr, opened_ts_ms)
+                                    _agg = realized_from_fills(trade_fills)
+                                    if _agg.get("has_close"):
+                                        rec_exit_price = _agg["exit_px"]
+                                        rec_pnl = _agg["net_pnl"]
+                                        rec_gross = _agg["gross_pnl"]
+                                        rec_fees = _agg["fees"]
+                                        add_event(
+                                            f"Reconcile {asset}: net_pnl=${round_or_none(rec_pnl, 4)} "
+                                            f"(gross=${round_or_none(rec_gross, 4)}, fees=${round_or_none(rec_fees, 4)}) "
+                                            f"from {_agg['n_fills']} fill(s), exit=${round_or_none(rec_exit_price, 4)}"
+                                        )
+                                    else:
+                                        # No closing fill attributable → do NOT record a
+                                        # synthetic breakeven close; treat as unavailable.
+                                        rec_exit_unavailable = True
+                                except Exception as _e:
+                                    rec_exit_unavailable = True
+                                    logging.warning("Phase1: fill lookup failed for %s reconcile: %s", asset, _e)
                             if rec_exit_unavailable:
                                 # pnl=null must NOT be routine — a position vanished
                                 # and we can't explain where. Alert; do not silently
                                 # corrupt performance memory (1.5/1.6).
-                                _m = (f"Reconcile {asset}: position gone but NO matching fills found — "
-                                      f"pnl unrecoverable. Investigate (manual close? fills API lag?).")
+                                _m = (f"Reconcile {asset}: position gone but no attributable close fill — "
+                                      f"pnl unrecoverable. Investigate (manual close? fills API lag? re-entry?).")
                                 add_event(_m)
                                 notify(_m, level="warn")
                             _try_record_close(asset, tr, rec_exit_price, rec_pnl, "reconcile_close",
-                                              fees_paid=rec_fees, gross_pnl=rec_gross)
+                                              fees_paid=rec_fees, gross_pnl=rec_gross,
+                                              pnl_basis=("net_of_fees" if not rec_exit_unavailable else "unavailable"))
                             active_trades.remove(tr)
                             save_active_trades()  # H5
                             _diary_rec = {
@@ -1993,6 +1994,12 @@ def main():
         outcomes = []
         for r in asset_recs[-5:]:
             outcomes.append("W" if float(r["pnl"]) > 0 else "L")
+        # 1.6: report the ACTUAL fee basis of the sampled rows — only reconcile
+        # (fill-derived) rows are net_of_fees; direct closes still record gross,
+        # so a blanket "net_of_fees" label would be a lie. (Phase 2/3 routes all
+        # closes through fills to make every row genuinely net.)
+        _bases = {r.get("pnl_basis", "gross") for r in asset_recs}
+        _basis = next(iter(_bases)) if len(_bases) == 1 else "mixed"
         return {
             "trades": len(asset_recs),
             "wins": len(wins),
@@ -2003,7 +2010,7 @@ def main():
             "net_pnl": round(net_pnl, 4),
             "last_5_outcomes": outcomes,
             "sufficient_sample": len(asset_recs) >= 6,   # 1.6
-            "pnl_basis": "net_of_fees",                   # 1.6
+            "pnl_basis": _basis,                          # 1.6 (net_of_fees | gross | mixed)
         }
 
     def calculate_sharpe(records):

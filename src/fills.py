@@ -53,15 +53,22 @@ def fill_coin_matches(f: dict, asset: str) -> bool:
     """Whether a fill belongs to ``asset``, tolerating the HIP-3 ``dex:`` prefix.
 
     active_trades may store ``xyz:CL`` while a fill reports ``CL`` (or vice
-    versa) — match on the bare symbol either way.
+    versa) — match on the bare symbol when exactly one side is prefixed. But if
+    BOTH sides are dex-prefixed they must match EXACTLY: two HIP-3 dexes exposing
+    the same bare symbol (``dexA:CL`` vs ``dexB:CL``) are different markets and
+    must not cross-attribute fills.
     """
     fc = f.get("coin") or f.get("asset") or ""
     if not fc:
         return False
     if fc == asset:
         return True
-    a_bare = asset.split(":", 1)[1] if ":" in asset else asset
-    f_bare = fc.split(":", 1)[1] if ":" in fc else fc
+    a_pref = ":" in asset
+    f_pref = ":" in fc
+    if a_pref and f_pref:
+        return False  # both prefixed but not identical → different markets
+    a_bare = asset.split(":", 1)[1] if a_pref else asset
+    f_bare = fc.split(":", 1)[1] if f_pref else fc
     return a_bare == f_bare
 
 
@@ -89,14 +96,22 @@ def realized_from_fills(fills):
         fills: fills belonging to a single position's lifetime (opens + closes).
 
     Returns dict:
-        net_pnl   — gross closedPnl minus ALL fees in the window (None if empty)
+        has_close — whether the window contains at least one CLOSING fill
+        net_pnl   — gross closedPnl minus ALL fees (None if no closing fill)
         gross_pnl — sum of closedPnl (exchange realized, pre-fee)
         fees      — sum of fee across the window (entry + exit)
-        exit_px   — price of the last closing fill (or last fill if none flagged)
+        exit_px   — price of the last closing fill (None if no closing fill)
         n_fills   — number of fills aggregated
+
+    CRITICAL (Phase 1 review): if the window has NO closing fill — e.g. the exit
+    fill is lagging the exchange's clearinghouse update — we return has_close
+    False / net_pnl None / exit_px None so the caller ALERTS rather than recording
+    a synthetic breakeven close at the entry price (a plausible-looking lie is
+    worse than a null).
     """
     if not fills:
-        return {"net_pnl": None, "gross_pnl": None, "fees": 0.0, "exit_px": None, "n_fills": 0}
+        return {"net_pnl": None, "gross_pnl": None, "fees": 0.0, "exit_px": None,
+                "n_fills": 0, "has_close": False}
     ordered = sorted(fills, key=fill_time_ms)
 
     def _num(f, key):
@@ -107,7 +122,10 @@ def realized_from_fills(fills):
 
     gross = sum(_num(f, "closedPnl") for f in ordered)
     fees = sum(_num(f, "fee") for f in ordered)
-    closing = [f for f in ordered if is_closing_fill(f)] or ordered
+    closing = [f for f in ordered if is_closing_fill(f)]
+    if not closing:
+        return {"net_pnl": None, "gross_pnl": gross, "fees": fees, "exit_px": None,
+                "n_fills": len(ordered), "has_close": False}
     exit_px = None
     try:
         exit_px = float(closing[-1].get("px") or 0) or None
@@ -119,7 +137,69 @@ def realized_from_fills(fills):
         "fees": fees,
         "exit_px": exit_px,
         "n_fills": len(ordered),
+        "has_close": True,
     }
+
+
+def attribute_position_fills(wfills, tr: dict, opened_ts_ms: int):
+    """Select the fills belonging to ONE position — contamination-proof.
+
+    The naive "every same-coin fill since opened_at-buffer" approach lets a PRIOR
+    or ADJACENT same-asset trade's fills leak into this position's realized PnL
+    (a -$20 loss recorded as a +$30 win when the previous trade's +$50 close sat
+    in the buffer). Strategy, in order:
+
+      1. Closing fills whose oid matches this trade's known exit orders
+         (tp_oid/tp1_oid/tp2_oid/sl_oid, and entry_oid if present) — oids are
+         globally unique, so nothing from another trade can match.
+      2. plus the single entry fill nearest ``opened_ts_ms`` (to capture the
+         entry fee), if within 2 minutes of the open.
+      3. FALLBACK, only when step 1 found no closing fill (manual/liquidation
+         close with no tracked oid): dir-based closing fills at/after
+         ``opened_ts_ms`` — but ONLY if the asset was not re-opened afterward
+         (which would make attribution ambiguous). On a detected re-open we do
+         NOT guess; the caller then sees has_close False and alerts.
+
+    ``opened_ts_ms`` must be > 0 (the caller guards the unparseable case).
+    Returns the attributed fills (possibly with no closing fill → caller alerts).
+    """
+    asset = tr.get("asset")
+    exit_oids = {
+        str(tr.get(k)) for k in ("tp_oid", "tp1_oid", "tp2_oid", "sl_oid", "entry_oid")
+        if tr.get(k) is not None
+    }
+    coin_fills = [f for f in (wfills or []) if fill_coin_matches(f, asset)]
+
+    matched = [f for f in coin_fills if str(f.get("oid")) in exit_oids]
+    matched_oids = {str(f.get("oid")) for f in matched}
+    has_oid_close = any(is_closing_fill(f) for f in matched)
+
+    # (2) nearest entry fill for the entry fee
+    entry_cands = [
+        f for f in coin_fills
+        if str(f.get("oid")) not in matched_oids and classify_fill(f, tr) == "entry"
+    ]
+    if entry_cands:
+        nearest = min(entry_cands, key=lambda f: abs(fill_time_ms(f) - opened_ts_ms))
+        if abs(fill_time_ms(nearest) - opened_ts_ms) <= 120_000:
+            matched.append(nearest)
+            matched_oids.add(str(nearest.get("oid")))
+
+    # (3) dir-based fallback, only if no oid-matched close and no re-open
+    if not has_oid_close:
+        post = [f for f in coin_fills if fill_time_ms(f) >= opened_ts_ms]
+        reopened = any(
+            classify_fill(f, tr) == "entry"
+            and str(f.get("oid")) not in matched_oids
+            and fill_time_ms(f) > opened_ts_ms + 5000
+            for f in post
+        )
+        if not reopened:
+            for f in post:
+                if is_closing_fill(f) and str(f.get("oid")) not in matched_oids:
+                    matched.append(f)
+                    matched_oids.add(str(f.get("oid")))
+    return matched
 
 
 def classify_fill(f: dict, tr: dict) -> str:
