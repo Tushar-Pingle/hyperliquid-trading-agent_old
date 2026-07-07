@@ -11,6 +11,7 @@ import logging
 import aiohttp
 from typing import TYPE_CHECKING
 from src.config_loader import CONFIG
+from src.fills import newest_fills, fill_time_ms  # Phase 1 (Truth Layer)
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants  # For MAINNET/TESTNET
@@ -395,13 +396,12 @@ class HyperliquidAPI:
             return []
 
     async def get_recent_fills(self, limit: int = 50):
-        """Return the most recent fills when supported by the SDK variant.
+        """Return the ``limit`` MOST-RECENT fills, independent of SDK ordering.
 
-        Args:
-            limit: Maximum number of fills to return.
-
-        Returns:
-            List of fill dictionaries or an empty list if unsupported.
+        Phase 1 (1.1): the old ``fills[-limit:]`` returned the OLDEST fills on a
+        newest-first response once lifetime fills exceeded ``limit`` — the single
+        root cause of the pnl=null epidemic and dead TP1 detection. We now sort
+        by time and take the newest, so ordering assumptions can't bite again.
         """
         try:
             # Some SDK versions expose user_fills; fall back gracefully if absent
@@ -411,11 +411,31 @@ class HyperliquidAPI:
                 fills = await self._retry(lambda: self.info.fills(self.query_address))
             else:
                 return []
-            if isinstance(fills, list):
-                return fills[-limit:]
-            return []
+            return newest_fills(fills, limit)
         except (RuntimeError, ValueError, KeyError, ConnectionError, AttributeError) as e:
             logging.error("Get recent fills error: %s", e)
+            return []
+
+    async def get_fills_since(self, start_time_ms: int):
+        """Return fills at/after ``start_time_ms`` (ms epoch).
+
+        Phase 1 (1.2): used to reconcile a specific position's exits — bounding by
+        the position's open time is both correct and cheap. Prefers the SDK's
+        ``user_fills_by_time``; falls back to filtering a recent-fills page.
+        """
+        try:
+            start_time_ms = int(start_time_ms)
+            if hasattr(self.info, 'user_fills_by_time'):
+                fills = await self._retry(
+                    lambda: self.info.user_fills_by_time(self.query_address, start_time_ms)
+                )
+                if isinstance(fills, list):
+                    return fills
+            # Fallback: page the most recent fills and filter by time.
+            page = await self.get_recent_fills(limit=2000)
+            return [f for f in page if fill_time_ms(f) >= start_time_ms]
+        except (RuntimeError, ValueError, KeyError, ConnectionError, AttributeError) as e:
+            logging.error("Get fills since error: %s", e)
             return []
 
     def extract_oids(self, order_result):

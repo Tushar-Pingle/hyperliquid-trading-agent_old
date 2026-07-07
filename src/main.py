@@ -23,6 +23,10 @@ from src.utils.formatting import format_number as fmt, format_size as fmt_sz
 from src.utils.prompt_utils import json_default, round_or_none, round_series
 from src.regime_analyzer import refresh_regime
 from src.notify import notify
+from src.fills import (
+    newest_fills, fill_is_buy, fill_coin_matches, fill_time_ms,
+    realized_from_fills, classify_fill,
+)
 
 load_dotenv()
 
@@ -191,10 +195,15 @@ def main():
             logging.warning("P2.5: write_trade_log failed (non-fatal): %s", e)
 
     def _try_record_close(asset, active_tr, exit_price, pnl, close_reason,
-                           margin=None, leverage=None, leverage_fallback=False):
+                           margin=None, leverage=None, leverage_fallback=False,
+                           fees_paid=None, gross_pnl=None):
         """Best-effort helper to record a close. Pulls entry / size / opened_at
         from the matching active_trade record when present so the close site
         only has to supply what it directly knows.
+
+        Phase 1 (1.4): records net PnL plus its components (gross_pnl, fees_paid)
+        and the tp/sl oids, so trade_log rows are auditable and pnl can be
+        reconstructed. A null pnl on a fill-backed close is an anomaly, not noise.
         """
         try:
             entry_price = None
@@ -225,12 +234,19 @@ def main():
                 "entry_price": entry_price,
                 "exit_price": exit_price,
                 "size": size,
-                "pnl": pnl,
+                "pnl": pnl,                       # net of fees when fill-derived (1.4)
+                "gross_pnl": gross_pnl,           # exchange closedPnl before fees
+                "fees_paid": fees_paid,           # entry + exit fees (1.4)
                 "margin": margin,
                 "leverage": leverage,
                 "leverage_fallback": leverage_fallback,
                 "duration_sec": duration_sec,
                 "close_reason": close_reason,
+                # oid_chain for audit (1.4)
+                "tp_oid": active_tr.get("tp_oid") if isinstance(active_tr, dict) else None,
+                "tp1_oid": active_tr.get("tp1_oid") if isinstance(active_tr, dict) else None,
+                "tp2_oid": active_tr.get("tp2_oid") if isinstance(active_tr, dict) else None,
+                "sl_oid": active_tr.get("sl_oid") if isinstance(active_tr, dict) else None,
             })
         except Exception as e:
             logging.warning("P2.5: _try_record_close failed (non-fatal): %s", e)
@@ -351,6 +367,7 @@ def main():
         daily_spend = {}                            # 0.5: {UTC-date: usd}
         daily_spend_alerted = set()
         daily_spend_limit = float(CONFIG.get("llm_daily_spend_alert_usd") or 1.0)
+        untracked_alerted = set()                   # 1.5: bare coins already paged as untracked
 
         while True:
             invocation_count += 1
@@ -542,6 +559,29 @@ def main():
                     except Exception:
                         continue
                 assets_with_orders = {o.get('coin') for o in (open_orders or []) if o.get('coin')}
+
+                # Phase 1 (1.5): cycle-start invariant — a position on the exchange
+                # that NO active_trade tracks is UNMANAGED by our TP/SL/exit-rules
+                # (this is the "2 live positions, active_trades.json=[]" end-state
+                # from the audit). Page the operator once per asset until adopted.
+                def _bare(a):
+                    return a.split(':', 1)[1] if a and ':' in a else a
+                _tracked_bare = {_bare(tr.get('asset')) for tr in active_trades}
+                for _pcoin in assets_with_positions:
+                    if _bare(_pcoin) not in _tracked_bare:
+                        if _pcoin not in untracked_alerted:
+                            untracked_alerted.add(_pcoin)
+                            _m = (f"INVARIANT: exchange position on {_pcoin} is UNTRACKED "
+                                  f"(no active_trade) — unmanaged by TP/SL/exit-rules. "
+                                  f"Investigate/adopt.")
+                            add_event(_m)
+                            notify(_m, level="critical")
+                    else:
+                        untracked_alerted.discard(_pcoin)
+                for _a in list(untracked_alerted):
+                    if _a not in assets_with_positions:
+                        untracked_alerted.discard(_a)
+
                 ORPHAN_CYCLES_REQUIRED = 2
                 for tr in active_trades[:]:
                     asset = tr.get('asset')
@@ -549,52 +589,61 @@ def main():
                         tr['_orphan_cycles'] = tr.get('_orphan_cycles', 0) + 1
                         if tr['_orphan_cycles'] >= ORPHAN_CYCLES_REQUIRED:
                             add_event(f"Reconciling stale active trade for {asset} (orphan for {tr['_orphan_cycles']} cycles)")
-                            # P2.5.1: recover exit price/pnl from exchange fills so
-                            # trade_log records have real numbers instead of null.
+                            # Phase 1 (1.2/1.4): recover REAL exit price + net PnL +
+                            # fees from exchange fills. Fetch the position's own
+                            # window (opened_at minus a 60s buffer to capture the
+                            # entry fill's fee) rather than a fixed-size page that
+                            # used to return the wrong (oldest) fills.
                             rec_exit_price = None
                             rec_pnl = None
+                            rec_gross = None
+                            rec_fees = None
                             rec_exit_unavailable = False
+                            opened_ts_ms = 0
+                            if tr.get('opened_at'):
+                                try:
+                                    opened_ts_ms = int(datetime.fromisoformat(
+                                        str(tr['opened_at']).replace('Z', '+00:00')
+                                    ).timestamp() * 1000)
+                                except Exception:
+                                    opened_ts_ms = 0
                             try:
-                                rec_fills = await hyperliquid.get_recent_fills(limit=100)
-                                opened_ts_ms = 0
-                                if tr.get('opened_at'):
-                                    try:
-                                        opened_ts_ms = int(datetime.fromisoformat(
-                                            str(tr['opened_at']).replace('Z', '+00:00')
-                                        ).timestamp() * 1000)
-                                    except Exception:
-                                        pass
-                                is_long = tr.get('is_long')
-                                close_fills = []
-                                for _f in rec_fills:
-                                    f_coin = _f.get('coin') or _f.get('asset') or ''
-                                    # Match asset name; strip HIP-3 prefix (xyz:CL → CL)
-                                    if f_coin != asset:
-                                        if not (':' in asset and asset.split(':', 1)[1] == f_coin):
-                                            continue
-                                    f_time = int(_f.get('time') or _f.get('timestamp') or 0)
-                                    if f_time < opened_ts_ms:
-                                        continue
-                                    f_is_buy = _f.get('isBuy')
-                                    # Close of a long = sell fill; close of a short = buy fill
-                                    if is_long is True and f_is_buy is True:
-                                        continue
-                                    if is_long is False and f_is_buy is False:
-                                        continue
-                                    close_fills.append(_f)
-                                if close_fills:
-                                    close_fills.sort(key=lambda _f: int(_f.get('time') or 0))
-                                    rec_exit_price = float(close_fills[-1].get('px') or 0) or None
-                                    pnl_parts = [float(_f['closedPnl']) for _f in close_fills
-                                                 if _f.get('closedPnl') is not None]
-                                    rec_pnl = sum(pnl_parts) if pnl_parts else None
+                                _window_start = max(0, opened_ts_ms - 60_000) if opened_ts_ms else 0
+                                if _window_start:
+                                    _wfills = await hyperliquid.get_fills_since(_window_start)
+                                else:
+                                    _wfills = await hyperliquid.get_recent_fills(limit=200)
+                                trade_fills = [
+                                    _f for _f in _wfills
+                                    if fill_coin_matches(_f, asset)
+                                    and fill_time_ms(_f) >= (_window_start or 0)
+                                ]
+                                if trade_fills:
+                                    _agg = realized_from_fills(trade_fills)
+                                    rec_exit_price = _agg["exit_px"]
+                                    rec_pnl = _agg["net_pnl"]
+                                    rec_gross = _agg["gross_pnl"]
+                                    rec_fees = _agg["fees"]
+                                    add_event(
+                                        f"Reconcile {asset}: net_pnl=${round_or_none(rec_pnl, 4)} "
+                                        f"(gross=${round_or_none(rec_gross, 4)}, fees=${round_or_none(rec_fees, 4)}) "
+                                        f"from {_agg['n_fills']} fill(s), exit=${round_or_none(rec_exit_price, 4)}"
+                                    )
                                 else:
                                     rec_exit_unavailable = True
-                                    add_event(f"No matching close fills found for {asset} reconcile; pnl stays null")
                             except Exception as _e:
                                 rec_exit_unavailable = True
-                                logging.warning("P2.5.1: fill lookup failed for %s reconcile: %s", asset, _e)
-                            _try_record_close(asset, tr, rec_exit_price, rec_pnl, "reconcile_close")
+                                logging.warning("Phase1: fill lookup failed for %s reconcile: %s", asset, _e)
+                            if rec_exit_unavailable:
+                                # pnl=null must NOT be routine — a position vanished
+                                # and we can't explain where. Alert; do not silently
+                                # corrupt performance memory (1.5/1.6).
+                                _m = (f"Reconcile {asset}: position gone but NO matching fills found — "
+                                      f"pnl unrecoverable. Investigate (manual close? fills API lag?).")
+                                add_event(_m)
+                                notify(_m, level="warn")
+                            _try_record_close(asset, tr, rec_exit_price, rec_pnl, "reconcile_close",
+                                              fees_paid=rec_fees, gross_pnl=rec_gross)
                             active_trades.remove(tr)
                             save_active_trades()  # H5
                             _diary_rec = {
@@ -606,6 +655,8 @@ def main():
                                 "opened_at": tr.get('opened_at'),
                                 "exit_price": rec_exit_price,
                                 "pnl": rec_pnl,
+                                "gross_pnl": rec_gross,
+                                "fees_paid": rec_fees,
                             }
                             if rec_exit_unavailable:
                                 _diary_rec["exit_data_unavailable"] = True
@@ -622,8 +673,10 @@ def main():
 
             recent_fills_struct = []
             try:
-                fills = await hyperliquid.get_recent_fills(limit=50)
-                for f_entry in fills[-20:]:
+                # Phase 1 (1.1): get_recent_fills now returns NEWEST-first, so take
+                # the leading 20 (was [-20:], which grabbed the oldest); and read
+                # direction via fill_is_buy (raw fills carry side/dir, not isBuy).
+                for f_entry in newest_fills(await hyperliquid.get_recent_fills(limit=50), 20):
                     try:
                         t_raw = f_entry.get('time') or f_entry.get('timestamp')
                         timestamp = None
@@ -639,9 +692,11 @@ def main():
                         recent_fills_struct.append({
                             "timestamp": timestamp,
                             "coin": f_entry.get('coin') or f_entry.get('asset'),
-                            "is_buy": f_entry.get('isBuy'),
+                            "is_buy": fill_is_buy(f_entry),
                             "size": round_or_none(f_entry.get('sz') or f_entry.get('size'), 6),
-                            "price": round_or_none(f_entry.get('px') or f_entry.get('price'), 2)
+                            "price": round_or_none(f_entry.get('px') or f_entry.get('price'), 2),
+                            "closed_pnl": round_or_none(f_entry.get('closedPnl'), 4),
+                            "fee": round_or_none(f_entry.get('fee'), 5),
                         })
                     except Exception:
                         continue
@@ -1913,8 +1968,14 @@ def main():
     def compute_asset_perf(records, asset, window):
         """Return per-asset win/loss stats from the last `window` closed trades (P3.3).
 
-        Returns None when fewer than 2 records exist for the asset (not enough
-        to compute a meaningful win rate — avoids spurious 0% or 100% displays).
+        Phase 1 (1.6): pnl is now NET OF FEES and reconcile-recovered wins (TP
+        fills) are finally recorded, so these stats reflect reality instead of a
+        loss-only subset. ``sufficient_sample`` (>=6 trades) is surfaced so a tiny
+        2-trade sample can no longer read as an authoritative "0% win rate" — the
+        exact fiction that locked the bot out for 9 days. (The full decaying,
+        size-modulating gate replaces the hard block in Phase 5.)
+
+        Returns None when fewer than 2 records exist for the asset.
         """
         asset_recs = [
             r for r in records
@@ -1941,6 +2002,8 @@ def main():
             "avg_loss": round(avg_loss, 4),
             "net_pnl": round(net_pnl, 4),
             "last_5_outcomes": outcomes,
+            "sufficient_sample": len(asset_recs) >= 6,   # 1.6
+            "pnl_basis": "net_of_fees",                   # 1.6
         }
 
     def calculate_sharpe(records):
